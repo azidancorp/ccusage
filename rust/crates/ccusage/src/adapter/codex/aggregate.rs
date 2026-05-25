@@ -10,13 +10,13 @@ use jiff::tz::TimeZone as JiffTimeZone;
 use rustc_hash::FxHasher;
 
 use crate::{
-    cli::{AgentReportKind, SharedArgs, WeekDay},
+    cli::{AgentReportKind, CodexSpeed, SharedArgs, WeekDay},
     fast::FxHashSet,
     format_date_tz, parse_ts_timestamp, parse_tz, wants_json, week_start, CodexGroup,
-    CodexTokenUsageEvent, Result,
+    CodexTokenUsageEvent, PricingMap, Result,
 };
 
-use super::{parser, paths};
+use super::{parser, paths, report::calculate_codex_event_cost};
 
 type CodexEventKey = (crate::TimestampMs, u64, usize, u64, u64, u64, u64, u64);
 type CodexDedupeShards = [Mutex<FxHashSet<CodexEventKey>>];
@@ -29,17 +29,19 @@ struct CodexAggregation {
 pub(super) fn load_groups(
     shared: &SharedArgs,
     kind: AgentReportKind,
+    pricing: &PricingMap,
+    speed: CodexSpeed,
 ) -> Result<BTreeMap<String, CodexGroup>> {
     let paths = paths::codex_usage_paths()?;
     if paths.len() == 1 && !wants_json(shared) {
-        return load_groups_from_directory(&paths[0], shared, kind);
+        return load_groups_from_directory(&paths[0], shared, kind, pricing, speed);
     }
     let mut groups = BTreeMap::new();
     let seen = create_dedupe_shards();
     for path in paths {
         merge_groups(
             &mut groups,
-            load_groups_from_directory_with_dedupe(&path, shared, kind, &seen)?,
+            load_groups_from_directory_with_dedupe(&path, shared, kind, pricing, speed, &seen)?,
         );
     }
     Ok(groups)
@@ -49,28 +51,32 @@ pub(super) fn load_groups_from_directory(
     sessions_dir: &Path,
     shared: &SharedArgs,
     kind: AgentReportKind,
+    pricing: &PricingMap,
+    speed: CodexSpeed,
 ) -> Result<BTreeMap<String, CodexGroup>> {
     let mut files = Vec::new();
     crate::collect_usage_files(sessions_dir, &mut files);
     if shared.single_thread {
-        return aggregate_files_local(sessions_dir, &files, shared, kind);
+        return aggregate_files_local(sessions_dir, &files, shared, kind, pricing, speed);
     }
     let seen = create_dedupe_shards();
-    aggregate_files_parallel(sessions_dir, &files, shared, kind, &seen)
+    aggregate_files_parallel(sessions_dir, &files, shared, kind, pricing, speed, &seen)
 }
 
 pub(super) fn load_groups_from_directory_with_dedupe(
     sessions_dir: &Path,
     shared: &SharedArgs,
     kind: AgentReportKind,
+    pricing: &PricingMap,
+    speed: CodexSpeed,
     seen: &CodexDedupeShards,
 ) -> Result<BTreeMap<String, CodexGroup>> {
     let mut files = Vec::new();
     crate::collect_usage_files(sessions_dir, &mut files);
     if shared.single_thread {
-        return aggregate_files(sessions_dir, &files, shared, kind, seen);
+        return aggregate_files(sessions_dir, &files, shared, kind, pricing, speed, seen);
     }
-    aggregate_files_parallel(sessions_dir, &files, shared, kind, seen)
+    aggregate_files_parallel(sessions_dir, &files, shared, kind, pricing, speed, seen)
 }
 
 fn aggregate_files(
@@ -78,6 +84,8 @@ fn aggregate_files(
     files: &[PathBuf],
     shared: &SharedArgs,
     kind: AgentReportKind,
+    pricing: &PricingMap,
+    speed: CodexSpeed,
     seen: &CodexDedupeShards,
 ) -> Result<BTreeMap<String, CodexGroup>> {
     let mut groups = BTreeMap::new();
@@ -89,6 +97,8 @@ fn aggregate_files(
             kind,
             timezone.as_ref(),
             shared,
+            pricing,
+            speed,
             seen,
             &mut groups,
         )?;
@@ -101,6 +111,8 @@ fn aggregate_files_parallel(
     files: &[PathBuf],
     shared: &SharedArgs,
     kind: AgentReportKind,
+    pricing: &PricingMap,
+    speed: CodexSpeed,
     seen: &CodexDedupeShards,
 ) -> Result<BTreeMap<String, CodexGroup>> {
     let worker_count = thread::available_parallelism()
@@ -108,7 +120,7 @@ fn aggregate_files_parallel(
         .unwrap_or(1)
         .min(files.len());
     if worker_count <= 1 {
-        return aggregate_files(sessions_dir, files, shared, kind, seen);
+        return aggregate_files(sessions_dir, files, shared, kind, pricing, speed, seen);
     }
 
     let chunks = crate::chunk_file_indexes_by_size(files, worker_count);
@@ -126,6 +138,8 @@ fn aggregate_files_parallel(
                         kind,
                         timezone.as_ref(),
                         shared,
+                        pricing,
+                        speed,
                         seen,
                         &mut groups,
                     )?;
@@ -153,11 +167,13 @@ fn aggregate_file(
     kind: AgentReportKind,
     timezone: Option<&JiffTimeZone>,
     shared: &SharedArgs,
+    pricing: &PricingMap,
+    speed: CodexSpeed,
     seen: &CodexDedupeShards,
     groups: &mut BTreeMap<String, CodexGroup>,
 ) -> Result<()> {
     parser::visit_codex_session_file(sessions_dir, file, |event| {
-        add_event_to_groups(&event, kind, timezone, shared, seen, groups)
+        add_event_to_groups(&event, kind, timezone, shared, pricing, speed, seen, groups)
     })
 }
 
@@ -166,8 +182,10 @@ fn aggregate_files_local(
     files: &[PathBuf],
     shared: &SharedArgs,
     kind: AgentReportKind,
+    pricing: &PricingMap,
+    speed: CodexSpeed,
 ) -> Result<BTreeMap<String, CodexGroup>> {
-    Ok(aggregate_files_local_with_seen(sessions_dir, files, shared, kind)?.groups)
+    Ok(aggregate_files_local_with_seen(sessions_dir, files, shared, kind, pricing, speed)?.groups)
 }
 
 fn aggregate_files_local_with_seen(
@@ -175,6 +193,8 @@ fn aggregate_files_local_with_seen(
     files: &[PathBuf],
     shared: &SharedArgs,
     kind: AgentReportKind,
+    pricing: &PricingMap,
+    speed: CodexSpeed,
 ) -> Result<CodexAggregation> {
     let mut aggregation = CodexAggregation {
         groups: BTreeMap::new(),
@@ -188,6 +208,8 @@ fn aggregate_files_local_with_seen(
             kind,
             timezone.as_ref(),
             shared,
+            pricing,
+            speed,
             &mut aggregation,
         )?;
     }
@@ -200,10 +222,12 @@ fn aggregate_file_local(
     kind: AgentReportKind,
     timezone: Option<&JiffTimeZone>,
     shared: &SharedArgs,
+    pricing: &PricingMap,
+    speed: CodexSpeed,
     aggregation: &mut CodexAggregation,
 ) -> Result<()> {
     parser::visit_codex_session_file(sessions_dir, file, |event| {
-        add_event_to_groups_local(&event, kind, timezone, shared, aggregation)
+        add_event_to_groups_local(&event, kind, timezone, shared, pricing, speed, aggregation)
     })
 }
 
@@ -212,6 +236,8 @@ fn add_event_to_groups(
     kind: AgentReportKind,
     timezone: Option<&JiffTimeZone>,
     shared: &SharedArgs,
+    pricing: &PricingMap,
+    speed: CodexSpeed,
     seen: &CodexDedupeShards,
     groups: &mut BTreeMap<String, CodexGroup>,
 ) -> Result<()> {
@@ -223,7 +249,9 @@ fn add_event_to_groups(
     if !insert_event_key(event, timestamp, model, seen) {
         return Ok(());
     }
-    add_deduped_event_to_groups(event, model, timestamp, kind, timezone, shared, groups)
+    add_deduped_event_to_groups(
+        event, model, timestamp, kind, timezone, shared, pricing, speed, groups,
+    )
 }
 
 fn add_event_to_groups_local(
@@ -231,6 +259,8 @@ fn add_event_to_groups_local(
     kind: AgentReportKind,
     timezone: Option<&JiffTimeZone>,
     shared: &SharedArgs,
+    pricing: &PricingMap,
+    speed: CodexSpeed,
     aggregation: &mut CodexAggregation,
 ) -> Result<()> {
     let Some(model) = event.model.as_deref().filter(|model| !model.is_empty()) else {
@@ -251,6 +281,8 @@ fn add_event_to_groups_local(
         kind,
         timezone,
         shared,
+        pricing,
+        speed,
         &mut aggregation.groups,
     )
 }
@@ -262,6 +294,8 @@ fn add_deduped_event_to_groups(
     kind: AgentReportKind,
     timezone: Option<&JiffTimeZone>,
     shared: &SharedArgs,
+    pricing: &PricingMap,
+    speed: CodexSpeed,
     groups: &mut BTreeMap<String, CodexGroup>,
 ) -> Result<()> {
     let date = format_date_tz(timestamp, timezone);
@@ -280,7 +314,7 @@ fn add_deduped_event_to_groups(
         AgentReportKind::Session => event.session_id.clone(),
     };
     let group = groups.entry(period).or_default();
-    accumulate_codex_event_into_group(group, event, model);
+    accumulate_codex_event_into_group(group, event, model, timestamp, pricing, speed);
     Ok(())
 }
 
@@ -288,12 +322,17 @@ fn accumulate_codex_event_into_group(
     group: &mut CodexGroup,
     event: &CodexTokenUsageEvent,
     model: &str,
+    timestamp: crate::TimestampMs,
+    pricing: &PricingMap,
+    speed: CodexSpeed,
 ) {
+    let cost = calculate_codex_event_cost(model, event, timestamp, pricing, speed);
     group.input_tokens += event.input_tokens;
     group.cached_input_tokens += event.cached_input_tokens;
     group.output_tokens += event.output_tokens;
     group.reasoning_output_tokens += event.reasoning_output_tokens;
     group.total_tokens += event.total_tokens;
+    group.cost = Some(group.cost.unwrap_or_default() + cost);
     if group
         .last_activity
         .as_deref()
@@ -308,6 +347,7 @@ fn accumulate_codex_event_into_group(
     model_usage.output_tokens += event.output_tokens;
     model_usage.reasoning_output_tokens += event.reasoning_output_tokens;
     model_usage.total_tokens += event.total_tokens;
+    model_usage.cost = Some(model_usage.cost.unwrap_or_default() + cost);
     model_usage.is_fallback |= event.is_fallback_model;
 }
 
@@ -364,6 +404,9 @@ fn merge_groups(target: &mut BTreeMap<String, CodexGroup>, source: BTreeMap<Stri
         target_group.output_tokens += group.output_tokens;
         target_group.reasoning_output_tokens += group.reasoning_output_tokens;
         target_group.total_tokens += group.total_tokens;
+        if let Some(cost) = group.cost {
+            target_group.cost = Some(target_group.cost.unwrap_or_default() + cost);
+        }
         if target_group.last_activity.as_deref().is_none_or(|current| {
             group
                 .last_activity
@@ -379,6 +422,9 @@ fn merge_groups(target: &mut BTreeMap<String, CodexGroup>, source: BTreeMap<Stri
             target_usage.output_tokens += usage.output_tokens;
             target_usage.reasoning_output_tokens += usage.reasoning_output_tokens;
             target_usage.total_tokens += usage.total_tokens;
+            if let Some(cost) = usage.cost {
+                target_usage.cost = Some(target_usage.cost.unwrap_or_default() + cost);
+            }
             target_usage.is_fallback |= usage.is_fallback;
         }
     }
@@ -388,6 +434,8 @@ pub(crate) fn aggregate_events(
     events: &[CodexTokenUsageEvent],
     kind: AgentReportKind,
     timezone: Option<&str>,
+    pricing: &PricingMap,
+    speed: CodexSpeed,
 ) -> Result<BTreeMap<String, CodexGroup>> {
     let mut groups = BTreeMap::new();
     let timezone = parse_tz(timezone).or_else(|| Some(JiffTimeZone::system()));
@@ -406,7 +454,7 @@ pub(crate) fn aggregate_events(
             AgentReportKind::Session => event.session_id.clone(),
         };
         let group = groups.entry(period).or_insert_with(CodexGroup::default);
-        accumulate_codex_event_into_group(group, event, model);
+        accumulate_codex_event_into_group(group, event, model, timestamp, pricing, speed);
     }
     Ok(groups)
 }

@@ -5,8 +5,11 @@ use serde_json::{json, Value};
 use crate::{
     cli::{AgentReportKind, CodexSpeed, SharedArgs},
     color, format_currency, format_models_multiline, format_number, json_float, print_box_title,
-    Align, CodexGroup, CodexModelUsage, Color, PricingMap, Result, SimpleTable,
+    Align, CodexGroup, CodexModelUsage, CodexTokenUsageEvent, Color, PricingMap, Result,
+    SimpleTable, TimestampMs,
 };
+
+use super::speed::resolve_codex_speed_for_timestamp;
 
 pub(super) fn report_from_groups(
     groups: &BTreeMap<String, CodexGroup>,
@@ -126,6 +129,42 @@ pub(crate) fn calculate_codex_model_cost(
     pricing: &PricingMap,
     speed: CodexSpeed,
 ) -> f64 {
+    calculate_codex_model_usage_cost(model, usage, pricing, speed)
+}
+
+pub(super) fn calculate_codex_event_cost(
+    model: &str,
+    event: &CodexTokenUsageEvent,
+    timestamp: TimestampMs,
+    pricing: &PricingMap,
+    speed: CodexSpeed,
+) -> f64 {
+    let usage = CodexModelUsage {
+        input_tokens: event.input_tokens,
+        cached_input_tokens: event.cached_input_tokens,
+        output_tokens: event.output_tokens,
+        reasoning_output_tokens: event.reasoning_output_tokens,
+        total_tokens: event.total_tokens,
+        cost: None,
+        is_fallback: event.is_fallback_model,
+    };
+    calculate_codex_model_usage_cost(
+        model,
+        &usage,
+        pricing,
+        resolve_codex_speed_for_timestamp(speed, timestamp),
+    )
+}
+
+fn calculate_codex_model_usage_cost(
+    model: &str,
+    usage: &CodexModelUsage,
+    pricing: &PricingMap,
+    speed: CodexSpeed,
+) -> f64 {
+    if let Some(cost) = usage.cost {
+        return cost;
+    }
     let Some(pricing) = pricing.find(model) else {
         return 0.0;
     };
@@ -155,10 +194,13 @@ pub(crate) fn calculate_group_cost(
     pricing: &PricingMap,
     speed: CodexSpeed,
 ) -> f64 {
+    if let Some(cost) = group.cost {
+        return cost;
+    }
     group
         .models
         .iter()
-        .map(|(model, usage)| calculate_codex_model_cost(model, usage, pricing, speed))
+        .map(|(model, usage)| calculate_codex_model_usage_cost(model, usage, pricing, speed))
         .sum()
 }
 
