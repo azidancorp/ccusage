@@ -8,7 +8,15 @@ use crate::{collect_files_with_extension, Result};
 
 pub(super) const KIMI_DATA_DIR_ENV: &str = "KIMI_DATA_DIR";
 pub(super) const KIMI_SESSIONS_DIR_NAME: &str = "sessions";
+pub(super) const KIMI_SUBAGENTS_DIR_NAME: &str = "subagents";
 pub(super) const KIMI_WIRE_FILE_NAME: &str = "wire.jsonl";
+pub(super) const MAIN_STREAM_ID: &str = "main";
+
+#[derive(Debug, Clone)]
+pub(super) struct KimiWireContext {
+    pub(super) session_id: String,
+    pub(super) stream_id: String,
+}
 
 pub(super) fn paths() -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
@@ -60,11 +68,76 @@ fn is_kimi_wire_file(sessions_path: &Path, file_path: &Path) -> bool {
     let Ok(relative) = file_path.strip_prefix(sessions_path) else {
         return false;
     };
-    relative
-        .components()
-        .filter(|component| matches!(component, Component::Normal(_)))
-        .count()
-        == 3
+    relative_wire_context(relative).is_some()
+}
+
+pub(super) fn wire_context_from_path(file_path: &Path) -> Option<KimiWireContext> {
+    let parts = path_normal_components(file_path);
+    let sessions_index = parts
+        .iter()
+        .rposition(|part| part == KIMI_SESSIONS_DIR_NAME)?;
+    wire_context_from_parts(&parts[sessions_index + 1..])
+}
+
+fn relative_wire_context(path: &Path) -> Option<KimiWireContext> {
+    let parts = path_normal_components(path);
+    wire_context_from_parts(&parts)
+}
+
+fn path_normal_components(path: &Path) -> Vec<String> {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => part.to_str().map(ToString::to_string),
+            _ => None,
+        })
+        .collect()
+}
+
+fn wire_context_from_parts(parts: &[String]) -> Option<KimiWireContext> {
+    if parts.len() < 3 || parts.last().map(String::as_str) != Some(KIMI_WIRE_FILE_NAME) {
+        return None;
+    }
+    let session_id = parts.get(1)?.trim();
+    if session_id.is_empty() {
+        return None;
+    }
+    let nested_parts = &parts[2..parts.len() - 1];
+    let stream_id = nested_stream_id(nested_parts)?;
+    Some(KimiWireContext {
+        session_id: session_id.to_string(),
+        stream_id,
+    })
+}
+
+fn nested_stream_id(parts: &[String]) -> Option<String> {
+    if parts.is_empty() {
+        return Some(MAIN_STREAM_ID.to_string());
+    }
+    if parts.len() % 2 != 0 {
+        return None;
+    }
+    let mut stream_id = MAIN_STREAM_ID.to_string();
+    for pair in parts.chunks_exact(2) {
+        if pair[0] != KIMI_SUBAGENTS_DIR_NAME {
+            return None;
+        }
+        let subagent_id = pair[1].trim();
+        if subagent_id.is_empty() {
+            return None;
+        }
+        stream_id = combine_stream_id(&stream_id, &format!("subagent:{subagent_id}"));
+    }
+    Some(stream_id)
+}
+
+pub(super) fn combine_stream_id(parent_stream_id: &str, child_stream_id: &str) -> String {
+    if child_stream_id == MAIN_STREAM_ID {
+        return parent_stream_id.to_string();
+    }
+    if parent_stream_id == MAIN_STREAM_ID {
+        return child_stream_id.to_string();
+    }
+    format!("{parent_stream_id}/{child_stream_id}")
 }
 
 #[cfg(test)]
@@ -88,8 +161,21 @@ mod tests {
         let _guard = super::super::KIMI_DATA_DIR_LOCK.lock().unwrap();
         let kimi_dir = temp_kimi_dir("discover");
         fs::create_dir_all(kimi_dir.join("sessions/group/session")).unwrap();
+        fs::create_dir_all(kimi_dir.join("sessions/group/session/subagents/agent-1")).unwrap();
+        fs::create_dir_all(kimi_dir.join("sessions/group/session/subagents/agent-1/extra"))
+            .unwrap();
         fs::create_dir_all(kimi_dir.join("sessions/nested/path/session")).unwrap();
         fs::write(kimi_dir.join("sessions/group/session/wire.jsonl"), "{}\n").unwrap();
+        fs::write(
+            kimi_dir.join("sessions/group/session/subagents/agent-1/wire.jsonl"),
+            "{}\n",
+        )
+        .unwrap();
+        fs::write(
+            kimi_dir.join("sessions/group/session/subagents/agent-1/extra/wire.jsonl"),
+            "{}\n",
+        )
+        .unwrap();
         fs::write(kimi_dir.join("sessions/group/session/other.jsonl"), "{}\n").unwrap();
         fs::write(
             kimi_dir.join("sessions/nested/path/session/wire.jsonl"),
@@ -101,9 +187,11 @@ mod tests {
         env::remove_var(KIMI_DATA_DIR_ENV);
         fs::remove_dir_all(&kimi_dir).unwrap();
 
-        assert_eq!(
-            files,
-            vec![kimi_dir.join("sessions/group/session/wire.jsonl")]
-        );
+        let mut expected = vec![
+            kimi_dir.join("sessions/group/session/wire.jsonl"),
+            kimi_dir.join("sessions/group/session/subagents/agent-1/wire.jsonl"),
+        ];
+        expected.sort();
+        assert_eq!(files, expected);
     }
 }

@@ -106,6 +106,122 @@ mod tests {
     }
 
     #[test]
+    fn loads_subagent_event_token_usage_from_parent_wire_files() {
+        let _guard = super::super::KIMI_DATA_DIR_LOCK.lock().unwrap();
+        let kimi_dir = temp_kimi_dir("subagent-event");
+        fs::create_dir_all(kimi_dir.join("sessions/group/session-a")).unwrap();
+        fs::write(kimi_dir.join("config.json"), r#"{"model":"kimi-k2"}"#).unwrap();
+        fs::write(
+            kimi_dir.join("sessions/group/session-a/wire.jsonl"),
+            [
+                r#"{"timestamp":1770983427.123,"message":{"type":"StatusUpdate","payload":{"token_usage":{"input_other":100,"output":50,"input_cache_read":10,"input_cache_creation":20},"message_id":"shared-id"}}}"#,
+                r#"{"timestamp":1770983427.123,"message":{"type":"SubagentEvent","payload":{"task_tool_call_id":"tool-1","event":{"type":"StatusUpdate","payload":{"token_usage":{"input_other":100,"output":50,"input_cache_read":10,"input_cache_creation":20},"message_id":"shared-id"}}}}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let _cleanup = EnvDirGuard::set(kimi_dir);
+        let shared = SharedArgs {
+            timezone: Some("UTC".to_string()),
+            ..SharedArgs::default()
+        };
+        let entries = load_entries(&shared, &PricingMap::load_embedded()).unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .all(|entry| entry.session_id.as_ref() == "session-a"));
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.data.message.usage.input_tokens)
+                .sum::<u64>(),
+            200
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.data.message.usage.output_tokens)
+                .sum::<u64>(),
+            100
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.data.message.usage.cache_creation_input_tokens)
+                .sum::<u64>(),
+            40
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.data.message.usage.cache_read_input_tokens)
+                .sum::<u64>(),
+            20
+        );
+    }
+
+    #[test]
+    fn loads_nested_subagent_wire_files_under_parent_session() {
+        let _guard = super::super::KIMI_DATA_DIR_LOCK.lock().unwrap();
+        let kimi_dir = temp_kimi_dir("nested-subagent");
+        fs::create_dir_all(kimi_dir.join("sessions/group/session-a/subagents/agent-1")).unwrap();
+        fs::write(kimi_dir.join("config.json"), r#"{"model":"kimi-k2"}"#).unwrap();
+        fs::write(
+            kimi_dir.join("sessions/group/session-a/wire.jsonl"),
+            r#"{"timestamp":1770983427.123,"message":{"type":"StatusUpdate","payload":{"token_usage":{"input_other":100,"output":50,"input_cache_read":10,"input_cache_creation":20},"message_id":"main-1"}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            kimi_dir.join("sessions/group/session-a/subagents/agent-1/wire.jsonl"),
+            r#"{"timestamp":1770983427.123,"message":{"type":"StatusUpdate","payload":{"token_usage":{"input_other":100,"output":50,"input_cache_read":10,"input_cache_creation":20},"message_id":"main-1"}}}"#,
+        )
+        .unwrap();
+        let _cleanup = EnvDirGuard::set(kimi_dir);
+        let shared = SharedArgs {
+            timezone: Some("UTC".to_string()),
+            ..SharedArgs::default()
+        };
+        let entries = load_entries(&shared, &PricingMap::load_embedded()).unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .all(|entry| entry.session_id.as_ref() == "session-a"));
+        assert!(entries
+            .iter()
+            .all(|entry| entry.model.as_deref() == Some("kimi-k2")));
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.data.message.usage.input_tokens)
+                .sum::<u64>(),
+            200
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.data.message.usage.output_tokens)
+                .sum::<u64>(),
+            100
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.data.message.usage.cache_creation_input_tokens)
+                .sum::<u64>(),
+            40
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.data.message.usage.cache_read_input_tokens)
+                .sum::<u64>(),
+            20
+        );
+    }
+
+    #[test]
     fn skips_malformed_and_zero_token_wire_lines() {
         let _guard = super::super::KIMI_DATA_DIR_LOCK.lock().unwrap();
         let kimi_dir = temp_kimi_dir("zero");

@@ -13,6 +13,11 @@ use crate::{
     TokenUsageRaw, UsageEntry, UsageMessage,
 };
 
+use super::paths::{
+    combine_stream_id, wire_context_from_path, KimiWireContext, KIMI_SESSIONS_DIR_NAME,
+    MAIN_STREAM_ID,
+};
+
 const DEFAULT_MODEL: &str = "kimi-for-coding";
 const DEFAULT_PROVIDER: &str = "moonshot";
 const KIMI_FOR_CODING_K2_6_CUTOFF_MS: i64 = 1_776_698_890_072;
@@ -22,6 +27,7 @@ pub(super) struct KimiUsageEntry {
     timestamp: TimestampMs,
     timestamp_text: String,
     session_id: String,
+    stream_id: String,
     model: String,
     message_id: Option<String>,
     input_tokens: u64,
@@ -33,13 +39,17 @@ pub(super) struct KimiUsageEntry {
 
 pub(super) fn read_wire_file(path: &Path) -> Result<Vec<KimiUsageEntry>> {
     let model = read_model_from_config(path);
+    let context = wire_context_from_path(path).unwrap_or_else(|| KimiWireContext {
+        session_id: extract_session_id_from_parent(path),
+        stream_id: MAIN_STREAM_ID.to_string(),
+    });
     let fallback_timestamp = file_modified_timestamp(path);
     let content = fs::read_to_string(path)?;
     Ok(content
         .lines()
         .filter(|line| line.contains("\"StatusUpdate\"") && line.contains("\"token_usage\""))
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter_map(|value| wire_line_to_entry(&value, path, &model, fallback_timestamp))
+        .filter_map(|value| wire_line_to_entry(&value, &model, fallback_timestamp, &context))
         .collect::<Vec<_>>())
 }
 
@@ -58,10 +68,11 @@ fn read_model_from_config(file_path: &Path) -> String {
 
 fn kimi_root_from_wire_path(file_path: &Path) -> Option<PathBuf> {
     file_path
-        .parent()?
-        .parent()?
-        .parent()?
-        .parent()
+        .ancestors()
+        .find(|path| {
+            path.file_name().and_then(|name| name.to_str()) == Some(KIMI_SESSIONS_DIR_NAME)
+        })
+        .and_then(Path::parent)
         .map(Path::to_path_buf)
 }
 
@@ -77,18 +88,16 @@ fn file_modified_timestamp(path: &Path) -> TimestampMs {
 
 fn wire_line_to_entry(
     value: &Value,
-    file_path: &Path,
     model: &str,
     fallback_timestamp: TimestampMs,
+    context: &KimiWireContext,
 ) -> Option<KimiUsageEntry> {
     if value.get("type").and_then(Value::as_str) == Some("metadata") {
         return None;
     }
     let message = value.get("message")?;
-    if message.get("type").and_then(Value::as_str) != Some("StatusUpdate") {
-        return None;
-    }
-    let payload = message.get("payload")?;
+    let (status_update, child_stream_id) = status_update_message(message)?;
+    let payload = status_update.get("payload")?;
     let token_usage = payload.get("token_usage")?;
     let input_tokens = json_value_u64(token_usage.get("input_other"));
     let output_tokens = json_value_u64(token_usage.get("output"));
@@ -114,7 +123,8 @@ fn wire_line_to_entry(
     Some(KimiUsageEntry {
         timestamp,
         timestamp_text: crate::format_rfc3339_millis(timestamp),
-        session_id: extract_session_id(file_path),
+        session_id: context.session_id.clone(),
+        stream_id: combine_stream_id(&context.stream_id, &child_stream_id),
         model: model.to_string(),
         message_id: non_empty_json_string(payload.get("message_id")),
         input_tokens: usage.input_tokens,
@@ -123,6 +133,23 @@ fn wire_line_to_entry(
         cache_read_tokens: usage.cache_read_input_tokens,
         extra_total_tokens,
     })
+}
+
+fn status_update_message(message: &Value) -> Option<(&Value, String)> {
+    match message.get("type").and_then(Value::as_str)? {
+        "StatusUpdate" => Some((message, MAIN_STREAM_ID.to_string())),
+        "SubagentEvent" => {
+            let payload = message.get("payload")?;
+            let event = payload.get("event")?;
+            if event.get("type").and_then(Value::as_str) != Some("StatusUpdate") {
+                return None;
+            }
+            let task_tool_call_id = non_empty_json_string(payload.get("task_tool_call_id"))
+                .unwrap_or_else(|| "unknown".to_string());
+            Some((event, format!("subagent:{task_tool_call_id}")))
+        }
+        _ => None,
+    }
 }
 
 fn timestamp_from_seconds(seconds: f64) -> Option<TimestampMs> {
@@ -136,7 +163,7 @@ fn timestamp_from_seconds(seconds: f64) -> Option<TimestampMs> {
     Some(TimestampMs::from_millis(millis as i64))
 }
 
-fn extract_session_id(file_path: &Path) -> String {
+fn extract_session_id_from_parent(file_path: &Path) -> String {
     file_path
         .parent()
         .and_then(Path::file_name)
@@ -148,8 +175,9 @@ fn extract_session_id(file_path: &Path) -> String {
 
 pub(super) fn kimi_entry_key(entry: &KimiUsageEntry) -> String {
     format!(
-        "{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
         entry.session_id,
+        entry.stream_id,
         entry.message_id.as_deref().unwrap_or_default(),
         entry.timestamp_text,
         entry.model,
@@ -286,7 +314,9 @@ mod tests {
             }
         });
 
-        let entry = wire_line_to_entry(&value, &file, "kimi-k2", TimestampMs::UNIX_EPOCH).unwrap();
+        let context = wire_context_from_path(&file).unwrap();
+        let entry =
+            wire_line_to_entry(&value, "kimi-k2", TimestampMs::UNIX_EPOCH, &context).unwrap();
         fs::remove_dir_all(&kimi_dir).unwrap();
 
         assert_eq!(entry.output_tokens, 432);
@@ -307,6 +337,7 @@ mod tests {
             timestamp: TimestampMs::from_millis(1_776_698_890_071),
             timestamp_text: "2026-04-20T15:28:10.071Z".to_string(),
             session_id: "session-a".to_string(),
+            stream_id: MAIN_STREAM_ID.to_string(),
             model: DEFAULT_MODEL.to_string(),
             message_id: Some("msg-before".to_string()),
             input_tokens: usage.input_tokens,
