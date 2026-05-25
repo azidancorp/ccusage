@@ -115,7 +115,9 @@ mod tests {
             kimi_dir.join("sessions/group/session-a/wire.jsonl"),
             [
                 r#"{"timestamp":1770983427.123,"message":{"type":"StatusUpdate","payload":{"token_usage":{"input_other":100,"output":50,"input_cache_read":10,"input_cache_creation":20},"message_id":"shared-id"}}}"#,
+                r#"{"timestamp":1770983427.123,"message":{"type":"StatusUpdate","payload":{"token_usage":{"input_other":100,"output":50,"input_cache_read":10,"input_cache_creation":20},"message_id":"shared-id"}}}"#,
                 r#"{"timestamp":1770983427.123,"message":{"type":"SubagentEvent","payload":{"task_tool_call_id":"tool-1","event":{"type":"StatusUpdate","payload":{"token_usage":{"input_other":100,"output":50,"input_cache_read":10,"input_cache_creation":20},"message_id":"shared-id"}}}}}"#,
+                r#"{"timestamp":1770983427.123,"message":{"type":"SubagentEvent","payload":{"agent_id":"agent-2","parent_tool_call_id":"tool-2","subagent_type":"worker","event":{"type":"StatusUpdate","payload":{"token_usage":{"input_other":100,"output":50,"input_cache_read":10,"input_cache_creation":20},"message_id":"shared-id"}}}}}"#,
             ]
             .join("\n"),
         )
@@ -127,7 +129,7 @@ mod tests {
         };
         let entries = load_entries(&shared, &PricingMap::load_embedded()).unwrap();
 
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 3);
         assert!(entries
             .iter()
             .all(|entry| entry.session_id.as_ref() == "session-a"));
@@ -136,28 +138,28 @@ mod tests {
                 .iter()
                 .map(|entry| entry.data.message.usage.input_tokens)
                 .sum::<u64>(),
-            200
+            300
         );
         assert_eq!(
             entries
                 .iter()
                 .map(|entry| entry.data.message.usage.output_tokens)
                 .sum::<u64>(),
-            100
+            150
         );
         assert_eq!(
             entries
                 .iter()
                 .map(|entry| entry.data.message.usage.cache_creation_input_tokens)
                 .sum::<u64>(),
-            40
+            60
         );
         assert_eq!(
             entries
                 .iter()
                 .map(|entry| entry.data.message.usage.cache_read_input_tokens)
                 .sum::<u64>(),
-            20
+            30
         );
     }
 
@@ -169,7 +171,11 @@ mod tests {
         fs::write(kimi_dir.join("config.json"), r#"{"model":"kimi-k2"}"#).unwrap();
         fs::write(
             kimi_dir.join("sessions/group/session-a/wire.jsonl"),
-            r#"{"timestamp":1770983427.123,"message":{"type":"StatusUpdate","payload":{"token_usage":{"input_other":100,"output":50,"input_cache_read":10,"input_cache_creation":20},"message_id":"main-1"}}}"#,
+            [
+                r#"{"timestamp":1770983427.123,"message":{"type":"StatusUpdate","payload":{"token_usage":{"input_other":100,"output":50,"input_cache_read":10,"input_cache_creation":20},"message_id":"main-1"}}}"#,
+                r#"{"timestamp":1770983427.123,"message":{"type":"StatusUpdate","payload":{"token_usage":{"input_other":100,"output":50,"input_cache_read":10,"input_cache_creation":20},"message_id":"main-1"}}}"#,
+            ]
+            .join("\n"),
         )
         .unwrap();
         fs::write(
@@ -219,6 +225,25 @@ mod tests {
                 .sum::<u64>(),
             20
         );
+    }
+
+    #[test]
+    fn reads_model_config_when_ids_are_named_sessions() {
+        let _guard = super::super::KIMI_DATA_DIR_LOCK.lock().unwrap();
+        let kimi_dir = temp_kimi_dir("sessions-name");
+        fs::create_dir_all(kimi_dir.join("sessions/group/sessions/subagents/sessions")).unwrap();
+        fs::write(kimi_dir.join("config.json"), r#"{"model":"kimi-k2"}"#).unwrap();
+        fs::write(
+            kimi_dir.join("sessions/group/sessions/subagents/sessions/wire.jsonl"),
+            r#"{"timestamp":1770983427.123,"message":{"type":"StatusUpdate","payload":{"token_usage":{"input_other":100,"output":50},"message_id":"msg-1"}}}"#,
+        )
+        .unwrap();
+        let _cleanup = EnvDirGuard::set(kimi_dir);
+        let entries = load_entries(&SharedArgs::default(), &PricingMap::load_embedded()).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_id.as_ref(), "sessions");
+        assert_eq!(entries[0].model.as_deref(), Some("kimi-k2"));
     }
 
     #[test]

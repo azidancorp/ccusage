@@ -72,11 +72,30 @@ fn is_kimi_wire_file(sessions_path: &Path, file_path: &Path) -> bool {
 }
 
 pub(super) fn wire_context_from_path(file_path: &Path) -> Option<KimiWireContext> {
-    let parts = path_normal_components(file_path);
-    let sessions_index = parts
-        .iter()
-        .rposition(|part| part == KIMI_SESSIONS_DIR_NAME)?;
-    wire_context_from_parts(&parts[sessions_index + 1..])
+    file_path
+        .ancestors()
+        .filter(|path| {
+            path.file_name().and_then(|name| name.to_str()) == Some(KIMI_SESSIONS_DIR_NAME)
+        })
+        .filter_map(|sessions_path| {
+            let relative = file_path.strip_prefix(sessions_path).ok()?;
+            relative_wire_context(relative)
+        })
+        .last()
+}
+
+pub(super) fn root_from_wire_path(file_path: &Path) -> Option<PathBuf> {
+    file_path
+        .ancestors()
+        .filter(|path| {
+            path.file_name().and_then(|name| name.to_str()) == Some(KIMI_SESSIONS_DIR_NAME)
+        })
+        .filter_map(|sessions_path| {
+            let relative = file_path.strip_prefix(sessions_path).ok()?;
+            relative_wire_context(relative)?;
+            sessions_path.parent().map(Path::to_path_buf)
+        })
+        .last()
 }
 
 fn relative_wire_context(path: &Path) -> Option<KimiWireContext> {
@@ -156,6 +175,24 @@ mod tests {
         path
     }
 
+    struct EnvDirGuard {
+        dir: PathBuf,
+    }
+
+    impl EnvDirGuard {
+        fn set(dir: PathBuf) -> Self {
+            env::set_var(KIMI_DATA_DIR_ENV, &dir);
+            Self { dir }
+        }
+    }
+
+    impl Drop for EnvDirGuard {
+        fn drop(&mut self) {
+            env::remove_var(KIMI_DATA_DIR_ENV);
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
     #[test]
     fn discovers_wire_jsonl_files_under_sessions_group_session() {
         let _guard = super::super::KIMI_DATA_DIR_LOCK.lock().unwrap();
@@ -182,10 +219,8 @@ mod tests {
             "{}\n",
         )
         .unwrap();
-        env::set_var(KIMI_DATA_DIR_ENV, &kimi_dir);
+        let _cleanup = EnvDirGuard::set(kimi_dir.clone());
         let files = discover_wire_files().unwrap();
-        env::remove_var(KIMI_DATA_DIR_ENV);
-        fs::remove_dir_all(&kimi_dir).unwrap();
 
         let mut expected = vec![
             kimi_dir.join("sessions/group/session/wire.jsonl"),

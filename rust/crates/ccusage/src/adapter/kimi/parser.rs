@@ -14,8 +14,7 @@ use crate::{
 };
 
 use super::paths::{
-    combine_stream_id, wire_context_from_path, KimiWireContext, KIMI_SESSIONS_DIR_NAME,
-    MAIN_STREAM_ID,
+    combine_stream_id, root_from_wire_path, wire_context_from_path, KimiWireContext, MAIN_STREAM_ID,
 };
 
 const DEFAULT_MODEL: &str = "kimi-for-coding";
@@ -67,13 +66,7 @@ fn read_model_from_config(file_path: &Path) -> String {
 }
 
 fn kimi_root_from_wire_path(file_path: &Path) -> Option<PathBuf> {
-    file_path
-        .ancestors()
-        .find(|path| {
-            path.file_name().and_then(|name| name.to_str()) == Some(KIMI_SESSIONS_DIR_NAME)
-        })
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
+    root_from_wire_path(file_path)
 }
 
 fn file_modified_timestamp(path: &Path) -> TimestampMs {
@@ -144,9 +137,11 @@ fn status_update_message(message: &Value) -> Option<(&Value, String)> {
             if event.get("type").and_then(Value::as_str) != Some("StatusUpdate") {
                 return None;
             }
-            let task_tool_call_id = non_empty_json_string(payload.get("task_tool_call_id"))
+            let subagent_id = non_empty_json_string(payload.get("task_tool_call_id"))
+                .or_else(|| non_empty_json_string(payload.get("agent_id")))
+                .or_else(|| non_empty_json_string(payload.get("parent_tool_call_id")))
                 .unwrap_or_else(|| "unknown".to_string());
-            Some((event, format!("subagent:{task_tool_call_id}")))
+            Some((event, format!("subagent:{subagent_id}")))
         }
         _ => None,
     }
