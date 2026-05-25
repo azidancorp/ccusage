@@ -8,7 +8,7 @@ use crate::{
     print_usage_table, sort_summaries, wants_json, PricingMap, Result,
 };
 
-pub(crate) use loader::load_entries;
+pub(crate) use loader::{load_entries, source_files};
 pub(crate) use report::{report_from_rows, summarize_entries};
 
 #[cfg(test)]

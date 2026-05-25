@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, path::PathBuf};
 
 use crate::{cli::SharedArgs, collect_files_with_extension, parse_tz, LoadedEntry, Result};
 
@@ -31,4 +31,14 @@ fn load_entries_inner(shared: &SharedArgs, custom_path: Option<&str>) -> Result<
     }
     entries.sort_by_key(|entry| entry.timestamp);
     Ok(entries)
+}
+
+pub(crate) fn source_files(custom_path: Option<&str>) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for path in paths::paths(custom_path)? {
+        collect_files_with_extension(&path, "jsonl", &mut files);
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
 }

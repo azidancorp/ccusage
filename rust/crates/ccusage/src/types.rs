@@ -69,7 +69,7 @@ impl TokenCounts {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ModelBreakdown {
     pub(crate) model_name: String,
@@ -77,7 +77,7 @@ pub(crate) struct ModelBreakdown {
     pub(crate) output_tokens: u64,
     pub(crate) cache_creation_tokens: u64,
     pub(crate) cache_read_tokens: u64,
-    #[serde(skip_serializing)]
+    #[serde(default, skip_serializing)]
     pub(crate) extra_total_tokens: u64,
     pub(crate) cost: f64,
 }
@@ -113,7 +113,7 @@ pub(crate) struct CodexRawUsage {
     pub(crate) total_tokens: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CodexTokenUsageEvent {
     pub(crate) session_id: String,
     pub(crate) timestamp: String,

@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use crate::{
     cli::SharedArgs, collect_files_with_extension, parse_tz, LoadedEntry, PricingMap, Result,
 };
@@ -28,4 +30,14 @@ fn load_entries_inner(shared: &SharedArgs, pricing: &PricingMap) -> Result<Vec<L
     }
     entries.sort_by_key(|entry| entry.timestamp);
     Ok(entries)
+}
+
+pub(crate) fn source_files() -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for path in paths::paths()? {
+        collect_files_with_extension(&path.join("threads"), "json", &mut files);
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
 }

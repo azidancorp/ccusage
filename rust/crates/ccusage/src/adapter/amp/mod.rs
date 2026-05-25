@@ -8,7 +8,7 @@ use crate::{
     sort_summaries, wants_json, PricingMap, Result,
 };
 
-pub(crate) use loader::load_entries;
+pub(crate) use loader::{load_entries, source_files};
 #[cfg(test)]
 pub(crate) use parser::read_thread_file;
 pub(crate) use report::{print_table_for_agent, report_from_rows, summarize_entries};

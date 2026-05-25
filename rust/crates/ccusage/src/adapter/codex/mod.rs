@@ -10,9 +10,9 @@ use crate::{cli::AgentCommandArgs, log_level, print_json_or_jq, wants_json, Pric
 
 use aggregate::load_groups;
 pub(crate) use aggregate::{aggregate_events, filter_events_by_date};
-pub(crate) use loader::load_codex_events;
 #[cfg(test)]
 pub(crate) use loader::load_codex_events_from_directory;
+pub(crate) use loader::{load_codex_events, source_files};
 pub(crate) use report::{
     calculate_codex_model_cost, calculate_group_cost, non_cached_input_tokens,
 };

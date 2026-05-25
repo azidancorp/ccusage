@@ -83,6 +83,19 @@ pub(crate) fn load_entries_from_directory(
     Ok(entries)
 }
 
+pub(crate) fn source_files() -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for path in paths()? {
+        if let Some(db_path) = db_path(&path) {
+            files.push(db_path);
+        }
+        collect_files_with_extension(&path.join("storage").join("message"), "json", &mut files);
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
 fn db_path(opencode_dir: &Path) -> Option<PathBuf> {
     let default_path = opencode_dir.join("opencode.db");
     if default_path.is_file() {

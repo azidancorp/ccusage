@@ -1,5 +1,6 @@
-use std::{collections::BTreeMap, sync::mpsc, thread};
+use std::{collections::BTreeMap, env, path::PathBuf, sync::mpsc, thread};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::{
@@ -44,33 +45,41 @@ pub(super) fn load_rows(kind: AgentReportKind, shared: &SharedArgs) -> Result<Al
                 agent: "claude",
                 progress_agent: crate::progress::UsageLoadAgent::Claude,
                 load: Box::new(|| {
-                    load_session_capable_summary_agent_rows(
-                        "claude",
-                        load_kind,
-                        &loader_shared,
-                        claude::load_entries,
-                        summarize_entries,
-                    )
+                    load_agent_rows_cached("claude", load_kind, &loader_shared, || {
+                        load_session_capable_summary_agent_rows(
+                            "claude",
+                            load_kind,
+                            &loader_shared,
+                            claude::load_entries,
+                            summarize_entries,
+                        )
+                    })
                 }),
             },
             AgentLoadSpec {
                 index: 1,
                 agent: "codex",
                 progress_agent: crate::progress::UsageLoadAgent::Codex,
-                load: Box::new(|| load_codex_rows(load_kind, &loader_shared, &pricing)),
+                load: Box::new(|| {
+                    load_agent_rows_cached("codex", load_kind, &loader_shared, || {
+                        load_codex_rows(load_kind, &loader_shared, &pricing)
+                    })
+                }),
             },
             AgentLoadSpec {
                 index: 2,
                 agent: "opencode",
                 progress_agent: crate::progress::UsageLoadAgent::OpenCode,
                 load: Box::new(|| {
-                    load_summary_agent_rows(
-                        "opencode",
-                        load_kind,
-                        &loader_shared,
-                        || opencode::loader::load_entries(&loader_shared),
-                        opencode::summarize_entries,
-                    )
+                    load_agent_rows_cached("opencode", load_kind, &loader_shared, || {
+                        load_summary_agent_rows(
+                            "opencode",
+                            load_kind,
+                            &loader_shared,
+                            || opencode::loader::load_entries(&loader_shared),
+                            opencode::summarize_entries,
+                        )
+                    })
                 }),
             },
             AgentLoadSpec {
@@ -78,14 +87,16 @@ pub(super) fn load_rows(kind: AgentReportKind, shared: &SharedArgs) -> Result<Al
                 agent: "amp",
                 progress_agent: crate::progress::UsageLoadAgent::Amp,
                 load: Box::new(|| {
-                    load_priced_summary_agent_rows(
-                        "amp",
-                        load_kind,
-                        &loader_shared,
-                        &pricing,
-                        amp::load_entries,
-                        amp::summarize_entries,
-                    )
+                    load_agent_rows_cached("amp", load_kind, &loader_shared, || {
+                        load_priced_summary_agent_rows(
+                            "amp",
+                            load_kind,
+                            &loader_shared,
+                            &pricing,
+                            amp::load_entries,
+                            amp::summarize_entries,
+                        )
+                    })
                 }),
             },
             AgentLoadSpec {
@@ -138,13 +149,15 @@ pub(super) fn load_rows(kind: AgentReportKind, shared: &SharedArgs) -> Result<Al
                 agent: "pi",
                 progress_agent: crate::progress::UsageLoadAgent::Pi,
                 load: Box::new(|| {
-                    load_session_capable_summary_agent_rows(
-                        "pi",
-                        load_kind,
-                        &loader_shared,
-                        pi::load_entries,
-                        pi::summarize_entries,
-                    )
+                    load_agent_rows_cached("pi", load_kind, &loader_shared, || {
+                        load_session_capable_summary_agent_rows(
+                            "pi",
+                            load_kind,
+                            &loader_shared,
+                            pi::load_entries,
+                            pi::summarize_entries,
+                        )
+                    })
                 }),
             },
             AgentLoadSpec {
@@ -226,14 +239,16 @@ pub(super) fn load_rows(kind: AgentReportKind, shared: &SharedArgs) -> Result<Al
                 agent: "kimi",
                 progress_agent: crate::progress::UsageLoadAgent::Kimi,
                 load: Box::new(|| {
-                    load_priced_summary_agent_rows(
-                        "kimi",
-                        load_kind,
-                        &loader_shared,
-                        &pricing,
-                        kimi::load_entries,
-                        kimi::summarize_entries,
-                    )
+                    load_agent_rows_cached("kimi", load_kind, &loader_shared, || {
+                        load_priced_summary_agent_rows(
+                            "kimi",
+                            load_kind,
+                            &loader_shared,
+                            &pricing,
+                            kimi::load_entries,
+                            kimi::summarize_entries,
+                        )
+                    })
                 }),
             },
             AgentLoadSpec {
@@ -344,6 +359,218 @@ fn append_agent_rows(
         detected_agents.push(agent);
     }
     rows.extend(agent_rows.rows);
+}
+
+#[derive(Serialize, Deserialize)]
+struct CachedAgentRows {
+    rows: Vec<CachedAllRow>,
+    detected: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CachedAllRow {
+    period: String,
+    agent: String,
+    models_used: Vec<String>,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_creation_tokens: u64,
+    cache_read_tokens: u64,
+    total_tokens: u64,
+    total_cost_bits: u64,
+    metadata: Option<Value>,
+    metadata_agents: Option<Vec<String>>,
+    agent_breakdowns: Option<Vec<CachedAllRow>>,
+    model_breakdowns: Vec<CachedModelBreakdown>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CachedModelBreakdown {
+    model_name: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_creation_tokens: u64,
+    cache_read_tokens: u64,
+    extra_total_tokens: u64,
+    cost_bits: u64,
+}
+
+fn load_agent_rows_cached(
+    agent: &'static str,
+    kind: AgentReportKind,
+    shared: &SharedArgs,
+    load_rows: impl FnOnce() -> Result<AgentRows>,
+) -> Result<AgentRows> {
+    let Some(signature) = agent_source_signature(agent)? else {
+        return load_rows();
+    };
+    let cached = crate::adapter::cache::load_source_value_with_cache(
+        agent,
+        kind,
+        shared,
+        "all-agent-rows-v3",
+        &signature,
+        || load_rows().map(CachedAgentRows::from),
+    )?;
+    Ok(cached.into())
+}
+
+fn agent_source_signature(agent: &str) -> Result<Option<String>> {
+    let mut extra_values = Vec::new();
+    let files = match agent {
+        "claude" => claude_source_files()?,
+        "codex" => codex::source_files()?,
+        "opencode" => opencode::loader::source_files()?,
+        "amp" => amp::source_files()?,
+        "pi" => pi::source_files(None)?,
+        "kimi" => {
+            extra_values.push(format!(
+                "KIMI_MODEL_NAME={}",
+                env::var("KIMI_MODEL_NAME").unwrap_or_default()
+            ));
+            kimi::source_files()?
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(crate::adapter::cache::create_file_state_signature(
+        &files,
+        &extra_values,
+    )))
+}
+
+fn claude_source_files() -> Result<Vec<PathBuf>> {
+    let paths = claude::claude_paths()?;
+    Ok(claude::usage_files(&paths, None))
+}
+
+impl From<AgentRows> for CachedAgentRows {
+    fn from(rows: AgentRows) -> Self {
+        Self {
+            detected: rows.detected,
+            rows: rows.rows.iter().map(CachedAllRow::from).collect(),
+        }
+    }
+}
+
+impl From<CachedAgentRows> for AgentRows {
+    fn from(rows: CachedAgentRows) -> Self {
+        Self {
+            detected: rows.detected,
+            rows: rows.rows.into_iter().map(AllRow::from).collect(),
+        }
+    }
+}
+
+impl From<&AllRow> for CachedAllRow {
+    fn from(row: &AllRow) -> Self {
+        Self {
+            period: row.period.clone(),
+            agent: row.agent.to_string(),
+            models_used: row.models_used.clone(),
+            input_tokens: row.input_tokens,
+            output_tokens: row.output_tokens,
+            cache_creation_tokens: row.cache_creation_tokens,
+            cache_read_tokens: row.cache_read_tokens,
+            total_tokens: row.total_tokens,
+            total_cost_bits: row.total_cost.to_bits(),
+            metadata: row.metadata.clone(),
+            metadata_agents: row
+                .metadata_agents
+                .as_ref()
+                .map(|agents| agents.iter().map(|agent| (*agent).to_string()).collect()),
+            agent_breakdowns: row.agent_breakdowns.as_ref().map(|rows| {
+                rows.iter()
+                    .map(CachedAllRow::from)
+                    .collect::<Vec<CachedAllRow>>()
+            }),
+            model_breakdowns: row
+                .model_breakdowns
+                .iter()
+                .map(CachedModelBreakdown::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<CachedAllRow> for AllRow {
+    fn from(row: CachedAllRow) -> Self {
+        Self {
+            period: row.period,
+            agent: owned_agent_to_static(row.agent),
+            models_used: row.models_used,
+            input_tokens: row.input_tokens,
+            output_tokens: row.output_tokens,
+            cache_creation_tokens: row.cache_creation_tokens,
+            cache_read_tokens: row.cache_read_tokens,
+            total_tokens: row.total_tokens,
+            total_cost: f64::from_bits(row.total_cost_bits),
+            metadata: row.metadata,
+            metadata_agents: row.metadata_agents.map(|agents| {
+                agents
+                    .into_iter()
+                    .map(owned_agent_to_static)
+                    .collect::<Vec<&'static str>>()
+            }),
+            agent_breakdowns: row
+                .agent_breakdowns
+                .map(|rows| rows.into_iter().map(AllRow::from).collect()),
+            model_breakdowns: row
+                .model_breakdowns
+                .into_iter()
+                .map(ModelBreakdown::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<&ModelBreakdown> for CachedModelBreakdown {
+    fn from(model: &ModelBreakdown) -> Self {
+        Self {
+            model_name: model.model_name.clone(),
+            input_tokens: model.input_tokens,
+            output_tokens: model.output_tokens,
+            cache_creation_tokens: model.cache_creation_tokens,
+            cache_read_tokens: model.cache_read_tokens,
+            extra_total_tokens: model.extra_total_tokens,
+            cost_bits: model.cost.to_bits(),
+        }
+    }
+}
+
+impl From<CachedModelBreakdown> for ModelBreakdown {
+    fn from(model: CachedModelBreakdown) -> Self {
+        Self {
+            model_name: model.model_name,
+            input_tokens: model.input_tokens,
+            output_tokens: model.output_tokens,
+            cache_creation_tokens: model.cache_creation_tokens,
+            cache_read_tokens: model.cache_read_tokens,
+            extra_total_tokens: model.extra_total_tokens,
+            cost: f64::from_bits(model.cost_bits),
+        }
+    }
+}
+
+fn owned_agent_to_static(agent: String) -> &'static str {
+    match agent.as_str() {
+        "all" => "all",
+        "claude" => "claude",
+        "codex" => "codex",
+        "opencode" => "opencode",
+        "amp" => "amp",
+        "droid" => "droid",
+        "codebuff" => "codebuff",
+        "hermes" => "hermes",
+        "pi" => "pi",
+        "goose" => "goose",
+        "openclaw" => "openclaw",
+        "kilo" => "kilo",
+        "copilot" => "copilot",
+        "gemini" => "gemini",
+        "kimi" => "kimi",
+        "qwen" => "qwen",
+        _ => Box::leak(agent.into_boxed_str()),
+    }
 }
 
 fn load_summary_agent_rows(

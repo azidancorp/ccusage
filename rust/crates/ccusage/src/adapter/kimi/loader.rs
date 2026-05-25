@@ -1,10 +1,10 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, path::PathBuf};
 
 use crate::{cli::SharedArgs, parse_tz, LoadedEntry, PricingMap, Result};
 
 use super::{
     parser::{kimi_entry_key, kimi_entry_to_loaded, read_wire_file},
-    paths::discover_wire_files,
+    paths::{discover_wire_files, paths, KIMI_CONFIG_JSON_FILE_NAME, KIMI_CONFIG_TOML_FILE_NAME},
 };
 
 pub(crate) fn load_entries(shared: &SharedArgs, pricing: &PricingMap) -> Result<Vec<LoadedEntry>> {
@@ -32,6 +32,17 @@ fn load_entries_inner(shared: &SharedArgs, pricing: &PricingMap) -> Result<Vec<L
     }
     entries.sort_by_key(|entry| entry.timestamp);
     Ok(entries)
+}
+
+pub(crate) fn source_files() -> Result<Vec<PathBuf>> {
+    let mut files = discover_wire_files()?;
+    for path in paths()? {
+        files.push(path.join(KIMI_CONFIG_TOML_FILE_NAME));
+        files.push(path.join(KIMI_CONFIG_JSON_FILE_NAME));
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
 }
 
 #[cfg(test)]
