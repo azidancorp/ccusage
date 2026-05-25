@@ -7,9 +7,12 @@ use std::{
 use crate::{collect_files_with_extension, Result};
 
 pub(super) const KIMI_DATA_DIR_ENV: &str = "KIMI_DATA_DIR";
+pub(super) const KIMI_MODEL_NAME_ENV: &str = "KIMI_MODEL_NAME";
 pub(super) const KIMI_SESSIONS_DIR_NAME: &str = "sessions";
 pub(super) const KIMI_SUBAGENTS_DIR_NAME: &str = "subagents";
 pub(super) const KIMI_WIRE_FILE_NAME: &str = "wire.jsonl";
+pub(super) const KIMI_CONFIG_JSON_FILE_NAME: &str = "config.json";
+pub(super) const KIMI_CONFIG_TOML_FILE_NAME: &str = "config.toml";
 pub(super) const MAIN_STREAM_ID: &str = "main";
 
 #[derive(Debug, Clone)]

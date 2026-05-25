@@ -38,7 +38,7 @@ fn load_entries_inner(shared: &SharedArgs, pricing: &PricingMap) -> Result<Vec<L
 mod tests {
     use std::{env, fs, path::PathBuf};
 
-    use super::super::paths::KIMI_DATA_DIR_ENV;
+    use super::super::paths::{KIMI_DATA_DIR_ENV, KIMI_MODEL_NAME_ENV};
     use super::*;
 
     struct EnvDirGuard {
@@ -59,6 +59,21 @@ mod tests {
         }
     }
 
+    struct EnvModelGuard;
+
+    impl EnvModelGuard {
+        fn set(model: &str) -> Self {
+            env::set_var(KIMI_MODEL_NAME_ENV, model);
+            Self
+        }
+    }
+
+    impl Drop for EnvModelGuard {
+        fn drop(&mut self) {
+            env::remove_var(KIMI_MODEL_NAME_ENV);
+        }
+    }
+
     fn temp_kimi_dir(name: &str) -> PathBuf {
         let mut path = env::temp_dir();
         let nanos = std::time::SystemTime::now()
@@ -67,6 +82,24 @@ mod tests {
             .as_nanos();
         path.push(format!("ccusage-kimi-{name}-{nanos}"));
         path
+    }
+
+    fn write_kimi_usage_file(kimi_dir: &std::path::Path, timestamp: &str) {
+        fs::create_dir_all(kimi_dir.join("sessions/group/session-a")).unwrap();
+        fs::write(
+            kimi_dir.join("sessions/group/session-a/wire.jsonl"),
+            format!(
+                r#"{{"timestamp":{timestamp},"message":{{"type":"StatusUpdate","payload":{{"token_usage":{{"input_other":1000000,"output":1000000,"input_cache_read":1000000}},"message_id":"msg-1"}}}}}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn assert_cost_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-12,
+            "expected {expected}, got {actual}"
+        );
     }
 
     #[test]
@@ -244,6 +277,87 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].session_id.as_ref(), "sessions");
         assert_eq!(entries[0].model.as_deref(), Some("kimi-k2"));
+    }
+
+    #[test]
+    fn loads_config_toml_display_slug_and_prices_migrating_model() {
+        let _guard = super::super::KIMI_DATA_DIR_LOCK.lock().unwrap();
+        let kimi_dir = temp_kimi_dir("config-toml");
+        fs::create_dir_all(&kimi_dir).unwrap();
+        fs::write(
+            kimi_dir.join("config.toml"),
+            [
+                r#"default_model = "kimi-code/kimi-for-coding""#,
+                r#"[models."kimi-code/kimi-for-coding"]"#,
+                r#"model = "kimi-for-coding""#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        write_kimi_usage_file(&kimi_dir, "1776698890.072");
+        let _cleanup = EnvDirGuard::set(kimi_dir);
+        let entries = load_entries(&SharedArgs::default(), &PricingMap::load_embedded()).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].model.as_deref(), Some("kimi-for-coding"));
+        assert_cost_close(entries[0].cost, 5.11);
+    }
+
+    #[test]
+    fn preserves_provider_qualified_model_from_config_toml() {
+        let _guard = super::super::KIMI_DATA_DIR_LOCK.lock().unwrap();
+        let kimi_dir = temp_kimi_dir("config-toml-provider");
+        fs::create_dir_all(&kimi_dir).unwrap();
+        fs::write(
+            kimi_dir.join("config.toml"),
+            [
+                r#"default_model = "moonshot/kimi-k2.6""#,
+                r#"[models."moonshot/kimi-k2.6"]"#,
+                r#"model = "moonshot/kimi-k2.6""#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        write_kimi_usage_file(&kimi_dir, "1776643200");
+        let _cleanup = EnvDirGuard::set(kimi_dir);
+        let entries = load_entries(&SharedArgs::default(), &PricingMap::load_embedded()).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].model.as_deref(), Some("moonshot/kimi-k2.6"));
+        assert_cost_close(entries[0].cost, 5.11);
+    }
+
+    #[test]
+    fn preserves_provider_qualified_model_from_legacy_config_json() {
+        let _guard = super::super::KIMI_DATA_DIR_LOCK.lock().unwrap();
+        let kimi_dir = temp_kimi_dir("legacy-config-provider");
+        fs::create_dir_all(&kimi_dir).unwrap();
+        fs::write(
+            kimi_dir.join("config.json"),
+            r#"{"model":"moonshot/kimi-k2.6"}"#,
+        )
+        .unwrap();
+        write_kimi_usage_file(&kimi_dir, "1776643200");
+        let _cleanup = EnvDirGuard::set(kimi_dir);
+        let entries = load_entries(&SharedArgs::default(), &PricingMap::load_embedded()).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].model.as_deref(), Some("moonshot/kimi-k2.6"));
+        assert_cost_close(entries[0].cost, 5.11);
+    }
+
+    #[test]
+    fn preserves_provider_qualified_model_from_env() {
+        let _guard = super::super::KIMI_DATA_DIR_LOCK.lock().unwrap();
+        let kimi_dir = temp_kimi_dir("env-provider");
+        write_kimi_usage_file(&kimi_dir, "1776643200");
+        let _cleanup = EnvDirGuard::set(kimi_dir);
+        let _model = EnvModelGuard::set("moonshot/kimi-k2.6");
+        let entries = load_entries(&SharedArgs::default(), &PricingMap::load_embedded()).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].model.as_deref(), Some("moonshot/kimi-k2.6"));
+        assert_cost_close(entries[0].cost, 5.11);
     }
 
     #[test]

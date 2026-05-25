@@ -1,5 +1,5 @@
 use std::{
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -14,7 +14,8 @@ use crate::{
 };
 
 use super::paths::{
-    combine_stream_id, root_from_wire_path, wire_context_from_path, KimiWireContext, MAIN_STREAM_ID,
+    combine_stream_id, root_from_wire_path, wire_context_from_path, KimiWireContext,
+    KIMI_CONFIG_JSON_FILE_NAME, KIMI_CONFIG_TOML_FILE_NAME, KIMI_MODEL_NAME_ENV, MAIN_STREAM_ID,
 };
 
 const DEFAULT_MODEL: &str = "kimi-for-coding";
@@ -36,6 +37,25 @@ pub(super) struct KimiUsageEntry {
     extra_total_tokens: u64,
 }
 
+#[derive(Debug, Clone)]
+struct KimiModelInfo {
+    display_model: String,
+}
+
+impl KimiModelInfo {
+    fn default_model() -> Self {
+        Self {
+            display_model: DEFAULT_MODEL.to_string(),
+        }
+    }
+
+    fn from_model(model: &str) -> Self {
+        Self {
+            display_model: non_empty_string(model).unwrap_or(DEFAULT_MODEL).to_string(),
+        }
+    }
+}
+
 pub(super) fn read_wire_file(path: &Path) -> Result<Vec<KimiUsageEntry>> {
     let model = read_model_from_config(path);
     let context = wire_context_from_path(path).unwrap_or_else(|| KimiWireContext {
@@ -52,17 +72,81 @@ pub(super) fn read_wire_file(path: &Path) -> Result<Vec<KimiUsageEntry>> {
         .collect::<Vec<_>>())
 }
 
-fn read_model_from_config(file_path: &Path) -> String {
+fn read_model_from_config(file_path: &Path) -> KimiModelInfo {
+    if let Ok(model) = env::var(KIMI_MODEL_NAME_ENV) {
+        if let Some(model) = non_empty_string(&model) {
+            return KimiModelInfo::from_model(model);
+        }
+    }
     let Some(root) = kimi_root_from_wire_path(file_path) else {
-        return DEFAULT_MODEL.to_string();
+        return KimiModelInfo::default_model();
     };
-    let Ok(content) = fs::read_to_string(root.join("config.json")) else {
-        return DEFAULT_MODEL.to_string();
-    };
-    let Ok(value) = serde_json::from_str::<Value>(&content) else {
-        return DEFAULT_MODEL.to_string();
-    };
-    non_empty_json_string(value.get("model")).unwrap_or_else(|| DEFAULT_MODEL.to_string())
+    if let Ok(content) = fs::read_to_string(root.join(KIMI_CONFIG_TOML_FILE_NAME)) {
+        if let Some(model) = parse_config_toml_model(&content) {
+            return model;
+        }
+    }
+    if let Ok(content) = fs::read_to_string(root.join(KIMI_CONFIG_JSON_FILE_NAME)) {
+        if let Ok(value) = serde_json::from_str::<Value>(&content) {
+            if let Some(model) = non_empty_json_string(value.get("model")) {
+                return KimiModelInfo::from_model(&model);
+            }
+        }
+    }
+    KimiModelInfo::default_model()
+}
+
+fn parse_config_toml_model(content: &str) -> Option<KimiModelInfo> {
+    let default_model = toml_string_assignment(content.lines(), "default_model")?;
+    let model_table = find_toml_model_table(content, &default_model);
+    let table_model = toml_string_assignment(model_table.iter().copied(), "model");
+    let display_model = table_model
+        .as_deref()
+        .or(Some(default_model.as_str()))
+        .and_then(non_empty_string)
+        .unwrap_or(DEFAULT_MODEL)
+        .to_string();
+    Some(KimiModelInfo { display_model })
+}
+
+fn find_toml_model_table<'a>(content: &'a str, model: &str) -> Vec<&'a str> {
+    let header = format!("[models.\"{model}\"]");
+    let mut in_table = false;
+    content
+        .lines()
+        .filter(move |line| {
+            let trimmed = line.trim();
+            if trimmed == header {
+                in_table = true;
+                return false;
+            }
+            if in_table && trimmed.starts_with('[') {
+                in_table = false;
+            }
+            in_table
+        })
+        .collect()
+}
+
+fn toml_string_assignment<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+    key: &str,
+) -> Option<String> {
+    lines.into_iter().find_map(|line| {
+        let line = line.split('#').next()?.trim();
+        let (left, right) = line.split_once('=')?;
+        (left.trim() == key).then(|| parse_toml_string(right.trim()))?
+    })
+}
+
+fn parse_toml_string(value: &str) -> Option<String> {
+    let value = value.strip_prefix('"')?.strip_suffix('"')?;
+    non_empty_string(value).map(ToString::to_string)
+}
+
+fn non_empty_string(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
 }
 
 fn kimi_root_from_wire_path(file_path: &Path) -> Option<PathBuf> {
@@ -81,7 +165,7 @@ fn file_modified_timestamp(path: &Path) -> TimestampMs {
 
 fn wire_line_to_entry(
     value: &Value,
-    model: &str,
+    model: &KimiModelInfo,
     fallback_timestamp: TimestampMs,
     context: &KimiWireContext,
 ) -> Option<KimiUsageEntry> {
@@ -118,7 +202,7 @@ fn wire_line_to_entry(
         timestamp_text: crate::format_rfc3339_millis(timestamp),
         session_id: context.session_id.clone(),
         stream_id: combine_stream_id(&context.stream_id, &child_stream_id),
-        model: model.to_string(),
+        model: model.display_model.clone(),
         message_id: non_empty_json_string(payload.get("message_id")),
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
@@ -254,7 +338,7 @@ fn calculate_kimi_cost(
 
 fn model_candidates(entry: &KimiUsageEntry) -> Vec<String> {
     let mut candidates = Vec::new();
-    if entry.model == DEFAULT_MODEL {
+    if is_kimi_for_coding_migrating_slug(&entry.model) {
         candidates.push(kimi_for_coding_pricing_model(entry.timestamp).to_string());
     }
     candidates.extend([
@@ -265,6 +349,13 @@ fn model_candidates(entry: &KimiUsageEntry) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     candidates.retain(|candidate| seen.insert(candidate.clone()));
     candidates
+}
+
+fn is_kimi_for_coding_migrating_slug(model: &str) -> bool {
+    matches!(
+        model.trim().to_ascii_lowercase().as_str(),
+        "kimi-for-coding" | "kimi-code/kimi-for-coding"
+    )
 }
 
 fn kimi_for_coding_pricing_model(timestamp: TimestampMs) -> &'static str {
@@ -310,8 +401,8 @@ mod tests {
         });
 
         let context = wire_context_from_path(&file).unwrap();
-        let entry =
-            wire_line_to_entry(&value, "kimi-k2", TimestampMs::UNIX_EPOCH, &context).unwrap();
+        let model = KimiModelInfo::from_model("kimi-k2");
+        let entry = wire_line_to_entry(&value, &model, TimestampMs::UNIX_EPOCH, &context).unwrap();
         fs::remove_dir_all(&kimi_dir).unwrap();
 
         assert_eq!(entry.output_tokens, 432);
@@ -356,5 +447,40 @@ mod tests {
         assert!((at_cost - 0.00032035).abs() < f64::EPSILON);
         assert_eq!(loaded.model.as_deref(), Some(DEFAULT_MODEL));
         assert_eq!(loaded.data.message.model.as_deref(), Some(DEFAULT_MODEL));
+    }
+
+    #[test]
+    fn prices_scoped_kimi_for_coding_by_timestamp_without_changing_display_model() {
+        let pricing = PricingMap::load_embedded();
+        let usage = TokenUsageRaw {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_creation_input_tokens: 20,
+            cache_read_input_tokens: 10,
+            speed: None,
+        };
+        let entry = KimiUsageEntry {
+            timestamp: TimestampMs::from_millis(1_776_698_890_072),
+            timestamp_text: "2026-04-20T15:28:10.072Z".to_string(),
+            session_id: "session-a".to_string(),
+            stream_id: MAIN_STREAM_ID.to_string(),
+            model: "kimi-code/kimi-for-coding".to_string(),
+            message_id: Some("msg-scoped".to_string()),
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_creation_tokens: usage.cache_creation_input_tokens,
+            cache_read_tokens: usage.cache_read_input_tokens,
+            extra_total_tokens: 0,
+        };
+
+        let cost = calculate_kimi_cost(&entry, CostMode::Calculate, &pricing, usage);
+        let loaded = kimi_entry_to_loaded(entry, None, CostMode::Calculate, &pricing);
+
+        assert!((cost - 0.00032035).abs() < f64::EPSILON);
+        assert_eq!(loaded.model.as_deref(), Some("kimi-code/kimi-for-coding"));
+        assert_eq!(
+            loaded.data.message.model.as_deref(),
+            Some("kimi-code/kimi-for-coding")
+        );
     }
 }
