@@ -56,6 +56,7 @@ pub(crate) struct SharedArgs {
     pub(crate) jq: Option<String>,
     pub(crate) config: Option<PathBuf>,
     pub(crate) compact: bool,
+    pub(crate) show_models: bool,
     pub(crate) single_thread: bool,
 }
 
@@ -292,6 +293,10 @@ fn parse_command(
     shared: SharedArgs,
     config: &ConfigContext,
 ) -> Result<Command, String> {
+    if shared.show_models && !matches!(command, "daily" | "monthly" | "weekly" | "session") {
+        return Err("--with-models is only supported for all-agent reports".to_string());
+    }
+
     match command {
         "daily" => parse_all_command(parser, shared, AgentReportKind::Daily, config),
         "monthly" => parse_all_command(parser, shared, AgentReportKind::Monthly, config),
@@ -485,6 +490,10 @@ fn parse_top_level_session_command(
             parser.next();
             continue;
         }
+        if matches!(parser.peek(), Some("--with-models")) {
+            parse_shared_arg(parser, &mut args.shared)?;
+            continue;
+        }
         if parse_shared_arg_for_command(parser, &mut args.shared)? {
             continue;
         }
@@ -495,6 +504,9 @@ fn parse_top_level_session_command(
     }
 
     if args.id.is_some() {
+        if args.shared.show_models {
+            return Err("--with-models is only supported for all-agent reports".to_string());
+        }
         return Ok(Command::Session(args));
     }
 
@@ -541,7 +553,11 @@ fn parse_claude_monthly_command(
     _config: &ConfigContext,
 ) -> Result<Command, String> {
     while parser.peek().is_some() {
-        parse_shared_arg(parser, &mut shared)?;
+        if parse_shared_arg_for_command(parser, &mut shared)? {
+            continue;
+        }
+        let flag = parser.next_flag()?;
+        return Err(format!("Unknown monthly option '{flag}'"));
     }
     Ok(Command::Monthly(shared))
 }
@@ -623,7 +639,11 @@ fn parse_basic_agent_command(
 ) -> Result<Command, String> {
     let kind = parse_agent_report_kind(parser, agent, reports)?;
     while parser.peek().is_some() {
-        parse_shared_arg(parser, &mut shared)?;
+        if parse_shared_arg_for_command(parser, &mut shared)? {
+            continue;
+        }
+        let flag = parser.next_flag()?;
+        return Err(format!("Unknown {agent} option '{flag}'"));
     }
     Ok(command(agent_command_args(shared, kind)))
 }
@@ -777,6 +797,7 @@ fn parse_shared_arg(parser: &mut ArgParser, shared: &mut SharedArgs) -> Result<(
         "-q" | "--jq" => shared.jq = Some(parser.value_for("--jq")?),
         "--config" => shared.config = Some(PathBuf::from(parser.value_for("--config")?)),
         "--compact" => shared.compact = true,
+        "--with-models" => shared.show_models = true,
         "--single-thread" => shared.single_thread = true,
         flag => return Err(format!("Unknown option '{flag}'")),
     }
@@ -1867,6 +1888,42 @@ mod tests {
     }
 
     #[test]
+    fn parses_all_agent_with_models_flag() {
+        let cli = parse(&["ccusage", "daily", "--with-models"]);
+        let Some(Command::All(args)) = cli.command else {
+            panic!("expected all-agent command");
+        };
+        assert!(args.shared.show_models);
+    }
+
+    #[test]
+    fn parses_with_models_flag_before_default_all_agent_report() {
+        let cli = parse(&["ccusage", "--with-models"]);
+        assert!(cli.command.is_none());
+        assert!(cli.shared.show_models);
+    }
+
+    #[test]
+    fn rejects_with_models_for_single_agent_reports() {
+        assert_eq!(
+            parse_error(&["ccusage", "codex", "daily", "--with-models"]),
+            "Unknown codex option '--with-models'"
+        );
+        assert_eq!(
+            parse_error(&["ccusage", "amp", "daily", "--with-models"]),
+            "Unknown amp option '--with-models'"
+        );
+        assert_eq!(
+            parse_error(&["ccusage", "--with-models", "codex", "daily"]),
+            "--with-models is only supported for all-agent reports"
+        );
+        assert_eq!(
+            parse_error(&["ccusage", "session", "--id", "abc", "--with-models"]),
+            "--with-models is only supported for all-agent reports"
+        );
+    }
+
+    #[test]
     fn applies_config_defaults_and_command_options_before_cli_options() {
         let path = temp_config_path("daily");
         fs::write(
@@ -2090,6 +2147,7 @@ mod tests {
 
         assert!(help.contains("--color"));
         assert!(help.contains("--no-color"));
+        assert!(help.contains("--with-models"));
     }
 
     #[test]

@@ -76,36 +76,43 @@ pub(super) fn print_table(
     }
     let terminal_width = crate::terminal_width();
     let compact = shared.compact || terminal_width < crate::USAGE_COMPACT_WIDTH_THRESHOLD;
-    let (headers, aligns) = all_table_columns(kind, compact);
+    let show_models = shared.show_models || shared.breakdown;
+    let (headers, aligns) = all_table_columns(kind, compact, show_models);
     let mut table = SimpleTable::new(headers, aligns, shared)
         .with_terminal_width(terminal_width)
         .with_date_compaction(true);
 
     for row in rows {
-        table.push(all_table_row(row, compact, false));
+        table.push(all_table_row(row, compact, false, show_models));
         if let Some(agent_breakdowns) = row.agent_breakdowns.as_ref() {
             for breakdown in agent_breakdowns {
-                table.push(all_table_row(breakdown, compact, true));
+                table.push(all_table_row(breakdown, compact, true, show_models));
                 if shared.breakdown && !breakdown.model_breakdowns.is_empty() {
                     push_model_breakdown_rows(
                         &mut table,
                         &breakdown.model_breakdowns,
                         compact,
+                        show_models,
                         shared,
                     );
                 }
             }
         } else if shared.breakdown && !row.model_breakdowns.is_empty() {
-            push_model_breakdown_rows(&mut table, &row.model_breakdowns, compact, shared);
+            push_model_breakdown_rows(
+                &mut table,
+                &row.model_breakdowns,
+                compact,
+                show_models,
+                shared,
+            );
         }
     }
     table.separator();
     let totals = totals_json(rows);
     let table_total_tokens = rows.iter().map(table_total_tokens).sum::<u64>();
     if compact {
-        table.push(vec![
+        let mut row = vec![
             color(shared, "Total", Color::Yellow),
-            String::new(),
             String::new(),
             color(
                 shared,
@@ -127,11 +134,14 @@ pub(super) fn print_table(
                 ),
                 Color::Yellow,
             ),
-        ]);
+        ];
+        if show_models {
+            row.insert(2, String::new());
+        }
+        table.push(row);
     } else {
-        table.push(vec![
+        let mut row = vec![
             color(shared, "Total", Color::Yellow),
-            String::new(),
             String::new(),
             color(
                 shared,
@@ -164,7 +174,11 @@ pub(super) fn print_table(
                 ),
                 Color::Yellow,
             ),
-        ]);
+        ];
+        if show_models {
+            row.insert(2, String::new());
+        }
+        table.push(row);
     }
     table.print()?;
     if compact {
@@ -217,7 +231,12 @@ fn detected_agent_labels(rows: &[AllRow], detected_agents: &[&'static str]) -> S
         .join(", ")
 }
 
-pub(super) fn all_table_row(row: &AllRow, compact: bool, breakdown: bool) -> Vec<String> {
+pub(super) fn all_table_row(
+    row: &AllRow,
+    compact: bool,
+    breakdown: bool,
+    show_models: bool,
+) -> Vec<String> {
     let period = if breakdown {
         String::new()
     } else {
@@ -237,27 +256,33 @@ pub(super) fn all_table_row(row: &AllRow, compact: bool, breakdown: bool) -> Vec
     };
 
     if compact {
-        return vec![
+        let mut cells = vec![
             period,
             agent,
-            models,
             format_number(row.input_tokens),
             format_number(row.output_tokens),
             format_currency(row.total_cost),
         ];
+        if show_models {
+            cells.insert(2, models);
+        }
+        return cells;
     }
 
-    vec![
+    let mut cells = vec![
         period,
         agent,
-        models,
         format_number(row.input_tokens),
         format_number(row.output_tokens),
         format_number(row.cache_creation_tokens),
         format_number(row.cache_read_tokens),
         format_number(table_total_tokens(row)),
         format_currency(row.total_cost),
-    ]
+    ];
+    if show_models {
+        cells.insert(2, models);
+    }
+    cells
 }
 
 fn table_total_tokens(row: &AllRow) -> u64 {
@@ -271,6 +296,7 @@ fn push_model_breakdown_rows(
     table: &mut SimpleTable,
     breakdowns: &[ModelBreakdown],
     compact: bool,
+    show_models: bool,
     shared: &SharedArgs,
 ) {
     for b in breakdowns {
@@ -282,17 +308,19 @@ fn push_model_breakdown_rows(
             Color::Grey,
         );
         if compact {
-            table.push(vec![
-                String::new(),
+            let mut row = vec![
                 String::new(),
                 model,
                 color(shared, format_number(b.input_tokens), Color::Grey),
                 color(shared, format_number(b.output_tokens), Color::Grey),
                 color(shared, format_currency(b.cost), Color::Grey),
-            ]);
+            ];
+            if show_models {
+                row.insert(1, String::new());
+            }
+            table.push(row);
         } else {
-            table.push(vec![
-                String::new(),
+            let mut row = vec![
                 String::new(),
                 model,
                 color(shared, format_number(b.input_tokens), Color::Grey),
@@ -301,7 +329,11 @@ fn push_model_breakdown_rows(
                 color(shared, format_number(b.cache_read_tokens), Color::Grey),
                 color(shared, format_number(total), Color::Grey),
                 color(shared, format_currency(b.cost), Color::Grey),
-            ]);
+            ];
+            if show_models {
+                row.insert(1, String::new());
+            }
+            table.push(row);
         }
     }
 }
@@ -309,52 +341,49 @@ fn push_model_breakdown_rows(
 pub(super) fn all_table_columns(
     kind: AgentReportKind,
     compact: bool,
+    show_models: bool,
 ) -> (Vec<&'static str>, Vec<Align>) {
     if compact {
-        return (
-            vec![
-                first_column(kind),
-                "Agent",
-                "Models",
-                "Input",
-                "Output",
-                "Cost (USD)",
-            ],
-            vec![
-                Align::Left,
-                Align::Left,
-                Align::Left,
-                Align::Right,
-                Align::Right,
-                Align::Right,
-            ],
-        );
+        let mut headers = vec![first_column(kind), "Agent", "Input", "Output", "Cost (USD)"];
+        let mut aligns = vec![
+            Align::Left,
+            Align::Left,
+            Align::Right,
+            Align::Right,
+            Align::Right,
+        ];
+        if show_models {
+            headers.insert(2, "Models");
+            aligns.insert(2, Align::Left);
+        }
+        return (headers, aligns);
     }
 
-    (
-        vec![
-            first_column(kind),
-            "Agent",
-            "Models",
-            "Input",
-            "Output",
-            "Cache Create",
-            "Cache Read",
-            "Total Tokens",
-            "Cost (USD)",
-        ],
-        vec![
-            Align::Left,
-            Align::Left,
-            Align::Left,
-            Align::Right,
-            Align::Right,
-            Align::Right,
-            Align::Right,
-            Align::Right,
-            Align::Right,
-        ],
-    )
+    let mut headers = vec![
+        first_column(kind),
+        "Agent",
+        "Input",
+        "Output",
+        "Cache Create",
+        "Cache Read",
+        "Total Tokens",
+        "Cost (USD)",
+    ];
+    let mut aligns = vec![
+        Align::Left,
+        Align::Left,
+        Align::Right,
+        Align::Right,
+        Align::Right,
+        Align::Right,
+        Align::Right,
+        Align::Right,
+    ];
+    if show_models {
+        headers.insert(2, "Models");
+        aligns.insert(2, Align::Left);
+    }
+    (headers, aligns)
 }
 
 pub(super) fn sort_rows(rows: &mut [AllRow], order: &SortOrder) {

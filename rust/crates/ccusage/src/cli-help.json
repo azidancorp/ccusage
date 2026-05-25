@@ -93,6 +93,11 @@
 			"default": "false"
 		},
 		{
+			"flags": "--with-models",
+			"description": "Show model names in table output",
+			"default": "false"
+		},
+		{
 			"flags": "--color",
 			"description": "Enable colored output. FORCE_COLOR=1 has the same effect.",
 			"default": "auto"
