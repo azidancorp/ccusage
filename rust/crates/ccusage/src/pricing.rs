@@ -540,6 +540,27 @@ impl PricingMap {
                 fast_multiplier: 1.0,
             },
         );
+        // Source: https://docs.z.ai/guides/overview/pricing (GLM-5.1 headline API rate).
+        // The zai "coding plan" is a flat-rate subscription, so OpenCode logs cost 0;
+        // we approximate per-token cost from the official z.ai API price, matching how
+        // glm-4.7 already resolves via the LiteLLM `zai/glm-4.7` key. GLM-5.2 has no
+        // published API price yet, so it reuses the GLM-5.1 rate until z.ai lists one.
+        let glm_5_1_pricing = Pricing {
+            input: 0.98e-6,
+            output: 3.08e-6,
+            cache_create: 0.98e-6,
+            cache_read: 0.26e-6,
+            cache_read_explicit: true,
+            input_above_200k: None,
+            output_above_200k: None,
+            cache_create_above_200k: None,
+            cache_read_above_200k: None,
+            fast_multiplier: 1.0,
+        };
+        self.entries.insert("glm-5.1".to_string(), glm_5_1_pricing);
+        self.entries.insert("glm-5.2".to_string(), glm_5_1_pricing);
+        self.context_limits.insert("glm-5.1".to_string(), 200_000);
+        self.context_limits.insert("glm-5.2".to_string(), 200_000);
         self.context_limits.insert("gpt-5.5".to_string(), 1_050_000);
         self.context_limits
             .insert("grok-4.3".to_string(), 1_000_000);
@@ -649,6 +670,24 @@ mod tests {
         assert!(kimi_k26.cache_read_explicit);
         assert_eq!(pricing.context_limit("moonshot/kimi-k2.5"), Some(262_144));
         assert_eq!(pricing.context_limit("moonshot/kimi-k2.6"), Some(262_144));
+    }
+
+    #[test]
+    fn embedded_pricing_includes_zai_glm_5_for_opencode_coding_plan() {
+        let pricing = PricingMap::load_embedded();
+        let glm_5_1 = pricing.find("glm-5.1").unwrap();
+        let glm_5_2 = pricing.find("glm-5.2").unwrap();
+
+        assert_eq!(glm_5_1.input, 0.98e-6);
+        assert_eq!(glm_5_1.output, 3.08e-6);
+        assert_eq!(glm_5_1.cache_read, 0.26e-6);
+        assert!(glm_5_1.cache_read_explicit);
+        // GLM-5.2 reuses the GLM-5.1 rate until z.ai publishes its own price.
+        assert_eq!(glm_5_2.input, glm_5_1.input);
+        assert_eq!(glm_5_2.output, glm_5_1.output);
+        assert_eq!(glm_5_2.cache_read, glm_5_1.cache_read);
+        assert_eq!(pricing.context_limit("glm-5.1"), Some(200_000));
+        assert_eq!(pricing.context_limit("glm-5.2"), Some(200_000));
     }
 
     #[test]
