@@ -1,0 +1,452 @@
+{
+  "num_conversations": 13,
+  "conversations": [
+    {
+      "id": "02336419-419f-43c8-87d5-5828b9b7458c",
+      "start_time": "2026-06-26T10:09:56Z",
+      "end_time": "2026-06-26T10:13:04Z",
+      "duration_sec": 188.0,
+      "total_steps": 29,
+      "step_types": {
+        "USER_INPUT": 1,
+        "CONVERSATION_HISTORY": 1,
+        "PLANNER_RESPONSE": 14,
+        "LIST_DIRECTORY": 1,
+        "CHECKPOINT": 1,
+        "VIEW_FILE": 1,
+        "GENERIC": 4,
+        "INVOKE_SUBAGENT": 1,
+        "SYSTEM_MESSAGE": 4,
+        "CODE_ACTION": 1
+      },
+      "source_counts": {
+        "USER_EXPLICIT": 1,
+        "SYSTEM": 6,
+        "MODEL": 22
+      },
+      "user_prompts_chars": 521,
+      "model_responses_chars": 13434,
+      "tool_execution_steps": 8,
+      "tool_calls_count": 9,
+      "model_used": "gemini-3.5-flash",
+      "raw_model_detected": "gemini-3.5-flash",
+      "input_tokens": 6137.105263157895,
+      "output_tokens": 3535.263157894737,
+      "input_cost": 0.00046028289473684213,
+      "output_cost": 0.001060578947368421,
+      "total_cost": 0.0015208618421052632,
+      "logs": [
+        "cli-20260626_110741.log"
+      ]
+    },
+    {
+      "id": "110bf810-b6ab-4ba3-9f46-aa56e6218a09",
+      "start_time": "2026-06-26T10:32:17Z",
+      "end_time": "2026-06-26T10:35:29Z",
+      "duration_sec": 192.0,
+      "total_steps": 32,
+      "step_types": {
+        "GENERIC": 8,
+        "CONVERSATION_HISTORY": 1,
+        "PLANNER_RESPONSE": 15,
+        "CHECKPOINT": 1,
+        "INVOKE_SUBAGENT": 1,
+        "VIEW_FILE": 3,
+        "SYSTEM_MESSAGE": 3
+      },
+      "source_counts": {
+        "MODEL": 27,
+        "SYSTEM": 5
+      },
+      "user_prompts_chars": 0,
+      "model_responses_chars": 5940,
+      "tool_execution_steps": 12,
+      "tool_calls_count": 13,
+      "model_used": "gemini-3.5-flash",
+      "raw_model_detected": "gemini-3.5-flash",
+      "input_tokens": 8000.0,
+      "output_tokens": 1563.157894736842,
+      "input_cost": 0.0006,
+      "output_cost": 0.0004689473684210526,
+      "total_cost": 0.0010689473684210526,
+      "logs": [
+        "cli-20260626_112910.log"
+      ]
+    },
+    {
+      "id": "1c0316d2-06da-4779-b9a7-c6b4b55f51f4",
+      "start_time": "2026-06-26T10:10:35Z",
+      "end_time": "2026-06-26T10:12:35Z",
+      "duration_sec": 120.0,
+      "total_steps": 54,
+      "step_types": {
+        "USER_INPUT": 1,
+        "CONVERSATION_HISTORY": 1,
+        "PLANNER_RESPONSE": 26,
+        "VIEW_FILE": 16,
+        "CHECKPOINT": 1,
+        "LIST_DIRECTORY": 3,
+        "GREP_SEARCH": 4,
+        "CODE_ACTION": 1,
+        "GENERIC": 1
+      },
+      "source_counts": {
+        "USER_EXPLICIT": 1,
+        "SYSTEM": 2,
+        "MODEL": 51
+      },
+      "user_prompts_chars": 812,
+      "model_responses_chars": 4634,
+      "tool_execution_steps": 25,
+      "tool_calls_count": 25,
+      "model_used": "gemini-3.5-flash",
+      "raw_model_detected": "gemini-3.5-flash",
+      "input_tokens": 14713.684210526317,
+      "output_tokens": 1219.4736842105265,
+      "input_cost": 0.0011035263157894736,
+      "output_cost": 0.00036584210526315796,
+      "total_cost": 0.0014693684210526315,
+      "logs": []
+    },
+    {
+      "id": "59ac680e-1079-440b-94d6-9bd58d87e850",
+      "start_time": "2026-06-26T10:10:35Z",
+      "end_time": "2026-06-26T10:11:48Z",
+      "duration_sec": 73.0,
+      "total_steps": 28,
+      "step_types": {
+        "USER_INPUT": 1,
+        "CONVERSATION_HISTORY": 1,
+        "PLANNER_RESPONSE": 13,
+        "VIEW_FILE": 9,
+        "CHECKPOINT": 1,
+        "LIST_DIRECTORY": 1,
+        "CODE_ACTION": 1,
+        "GENERIC": 1
+      },
+      "source_counts": {
+        "USER_EXPLICIT": 1,
+        "SYSTEM": 2,
+        "MODEL": 25
+      },
+      "user_prompts_chars": 964,
+      "model_responses_chars": 4606,
+      "tool_execution_steps": 12,
+      "tool_calls_count": 12,
+      "model_used": "gemini-3.5-flash",
+      "raw_model_detected": "gemini-3.5-flash",
+      "input_tokens": 8253.684210526317,
+      "output_tokens": 1212.1052631578948,
+      "input_cost": 0.0006190263157894738,
+      "output_cost": 0.0003636315789473684,
+      "total_cost": 0.0009826578947368422,
+      "logs": []
+    },
+    {
+      "id": "79e7d3be-8d7b-4901-b4d9-48c561697542",
+      "start_time": "2026-06-26T10:19:46Z",
+      "end_time": "2026-06-26T10:22:56Z",
+      "duration_sec": 190.0,
+      "total_steps": 66,
+      "step_types": {
+        "PLANNER_RESPONSE": 34,
+        "RUN_COMMAND": 23,
+        "CODE_ACTION": 7,
+        "GREP_SEARCH": 1,
+        "GENERIC": 1
+      },
+      "source_counts": {
+        "MODEL": 66
+      },
+      "user_prompts_chars": 0,
+      "model_responses_chars": 12340,
+      "tool_execution_steps": 32,
+      "tool_calls_count": 33,
+      "model_used": "gemini-3.5-flash",
+      "raw_model_detected": "Gemini 3",
+      "input_tokens": 18000.0,
+      "output_tokens": 3247.3684210526317,
+      "input_cost": 0.0013499999999999999,
+      "output_cost": 0.0009742105263157894,
+      "total_cost": 0.0023242105263157893,
+      "logs": []
+    },
+    {
+      "id": "7fbe7120-2210-4d9d-a9c8-a19fc3851bdc",
+      "start_time": "2026-06-26T10:10:35Z",
+      "end_time": "2026-06-26T10:12:40Z",
+      "duration_sec": 125.0,
+      "total_steps": 46,
+      "step_types": {
+        "USER_INPUT": 1,
+        "CONVERSATION_HISTORY": 1,
+        "PLANNER_RESPONSE": 22,
+        "VIEW_FILE": 19,
+        "CHECKPOINT": 1,
+        "CODE_ACTION": 1,
+        "GENERIC": 1
+      },
+      "source_counts": {
+        "USER_EXPLICIT": 1,
+        "SYSTEM": 2,
+        "MODEL": 43
+      },
+      "user_prompts_chars": 976,
+      "model_responses_chars": 5272,
+      "tool_execution_steps": 21,
+      "tool_calls_count": 21,
+      "model_used": "gemini-3.5-flash",
+      "raw_model_detected": "gemini-3.5-flash",
+      "input_tokens": 12756.842105263158,
+      "output_tokens": 1387.3684210526317,
+      "input_cost": 0.0009567631578947368,
+      "output_cost": 0.0004162105263157895,
+      "total_cost": 0.0013729736842105263,
+      "logs": []
+    },
+    {
+      "id": "9b46ea0a-bf43-4229-b428-4bda8701442f",
+      "start_time": "2026-06-26T10:18:21Z",
+      "end_time": "2026-06-26T10:29:11Z",
+      "duration_sec": 650.0,
+      "total_steps": 88,
+      "step_types": {
+        "USER_INPUT": 3,
+        "CONVERSATION_HISTORY": 1,
+        "PLANNER_RESPONSE": 41,
+        "GENERIC": 6,
+        "CHECKPOINT": 1,
+        "LIST_DIRECTORY": 3,
+        "GREP_SEARCH": 6,
+        "VIEW_FILE": 6,
+        "RUN_COMMAND": 13,
+        "SEARCH_WEB": 1,
+        "SYSTEM_MESSAGE": 6,
+        "ERROR_MESSAGE": 1
+      },
+      "source_counts": {
+        "USER_EXPLICIT": 3,
+        "SYSTEM": 9,
+        "MODEL": 76
+      },
+      "user_prompts_chars": 731,
+      "model_responses_chars": 13128,
+      "tool_execution_steps": 35,
+      "tool_calls_count": 37,
+      "model_used": "gemini-3.5-flash",
+      "raw_model_detected": "gemini-3.5-flash",
+      "input_tokens": 19692.368421052633,
+      "output_tokens": 3454.7368421052633,
+      "input_cost": 0.0014769276315789474,
+      "output_cost": 0.001036421052631579,
+      "total_cost": 0.0025133486842105262,
+      "logs": [
+        "cli-20260626_111801.log"
+      ]
+    },
+    {
+      "id": "d2a7c70a-56bf-4638-82cf-a1bc3e903c9b",
+      "start_time": "2026-06-26T10:09:36Z",
+      "end_time": "2026-06-26T10:09:45Z",
+      "duration_sec": 9.0,
+      "total_steps": 12,
+      "step_types": {
+        "USER_INPUT": 1,
+        "CONVERSATION_HISTORY": 1,
+        "PLANNER_RESPONSE": 5,
+        "LIST_DIRECTORY": 2,
+        "CHECKPOINT": 1,
+        "VIEW_FILE": 2
+      },
+      "source_counts": {
+        "USER_EXPLICIT": 1,
+        "SYSTEM": 2,
+        "MODEL": 9
+      },
+      "user_prompts_chars": 496,
+      "model_responses_chars": 271,
+      "tool_execution_steps": 4,
+      "tool_calls_count": 4,
+      "model_used": "gemini-3.5-flash",
+      "raw_model_detected": "gemini-3.5-flash",
+      "input_tokens": 4130.526315789473,
+      "output_tokens": 71.31578947368422,
+      "input_cost": 0.0003097894736842105,
+      "output_cost": 2.1394736842105267e-05,
+      "total_cost": 0.0003311842105263158,
+      "logs": [
+        "cli-20260626_110741.log"
+      ]
+    },
+    {
+      "id": "d332e2cb-02b7-4ed9-a8b9-41727b807eff",
+      "start_time": "2026-06-26T10:34:21Z",
+      "end_time": "2026-06-26T10:35:03Z",
+      "duration_sec": 42.0,
+      "total_steps": 26,
+      "step_types": {
+        "LIST_DIRECTORY": 6,
+        "PLANNER_RESPONSE": 13,
+        "GREP_SEARCH": 2,
+        "ERROR_MESSAGE": 1,
+        "VIEW_FILE": 4
+      },
+      "source_counts": {
+        "MODEL": 25,
+        "SYSTEM": 1
+      },
+      "user_prompts_chars": 0,
+      "model_responses_chars": 1515,
+      "tool_execution_steps": 12,
+      "tool_calls_count": 12,
+      "model_used": "gemini-3.5-flash",
+      "raw_model_detected": "gemini-3.5-flash",
+      "input_tokens": 8000.0,
+      "output_tokens": 398.6842105263158,
+      "input_cost": 0.0006,
+      "output_cost": 0.00011960526315789473,
+      "total_cost": 0.0007196052631578947,
+      "logs": []
+    },
+    {
+      "id": "d725ae7d-c9d0-402f-9458-ce5f5ea0a377",
+      "start_time": "2026-06-26T10:10:37Z",
+      "end_time": "2026-06-26T10:35:32Z",
+      "duration_sec": 1495.0,
+      "total_steps": 108,
+      "step_types": {
+        "USER_INPUT": 4,
+        "CONVERSATION_HISTORY": 1,
+        "PLANNER_RESPONSE": 54,
+        "GREP_SEARCH": 5,
+        "CHECKPOINT": 1,
+        "VIEW_FILE": 9,
+        "GENERIC": 3,
+        "RUN_COMMAND": 26,
+        "SYSTEM_MESSAGE": 2,
+        "INVOKE_SUBAGENT": 1,
+        "CODE_ACTION": 2
+      },
+      "source_counts": {
+        "USER_EXPLICIT": 4,
+        "SYSTEM": 4,
+        "MODEL": 100
+      },
+      "user_prompts_chars": 1141,
+      "model_responses_chars": 12491,
+      "tool_execution_steps": 46,
+      "tool_calls_count": 51,
+      "model_used": "gemini-3.5-flash",
+      "raw_model_detected": "gemini-3.5-flash",
+      "input_tokens": 25300.263157894737,
+      "output_tokens": 3287.105263157895,
+      "input_cost": 0.001897519736842105,
+      "output_cost": 0.0009861315789473685,
+      "total_cost": 0.0028836513157894737,
+      "logs": [
+        "cli-20260626_111024.log",
+        "cli-20260626_111652.log"
+      ]
+    },
+    {
+      "id": "e8fb0ddb-09c3-4280-871c-cd92ec9b193d",
+      "start_time": "2026-06-26T10:30:03Z",
+      "end_time": "2026-06-26T10:32:15Z",
+      "duration_sec": 132.0,
+      "total_steps": 80,
+      "step_types": {
+        "USER_INPUT": 1,
+        "PLANNER_RESPONSE": 39,
+        "LIST_DIRECTORY": 15,
+        "CHECKPOINT": 1,
+        "VIEW_FILE": 17,
+        "GREP_SEARCH": 5,
+        "ERROR_MESSAGE": 1,
+        "GENERIC": 1
+      },
+      "source_counts": {
+        "USER_EXPLICIT": 1,
+        "MODEL": 77,
+        "SYSTEM": 2
+      },
+      "user_prompts_chars": 789,
+      "model_responses_chars": 6260,
+      "tool_execution_steps": 38,
+      "tool_calls_count": 37,
+      "model_used": "gemini-3.5-flash",
+      "raw_model_detected": "gemini-3.5-flash",
+      "input_tokens": 21207.631578947367,
+      "output_tokens": 1647.3684210526317,
+      "input_cost": 0.0015905723684210525,
+      "output_cost": 0.0004942105263157895,
+      "total_cost": 0.002084782894736842,
+      "logs": []
+    },
+    {
+      "id": "e9cf2235-ec02-4258-b754-f56ae1f7a4a4",
+      "start_time": "2026-06-26T10:30:03Z",
+      "end_time": "2026-06-26T10:32:12Z",
+      "duration_sec": 129.0,
+      "total_steps": 42,
+      "step_types": {
+        "USER_INPUT": 1,
+        "PLANNER_RESPONSE": 21,
+        "LIST_DIRECTORY": 6,
+        "CHECKPOINT": 1,
+        "VIEW_FILE": 11,
+        "GREP_SEARCH": 1,
+        "GENERIC": 1
+      },
+      "source_counts": {
+        "USER_EXPLICIT": 1,
+        "MODEL": 40,
+        "SYSTEM": 1
+      },
+      "user_prompts_chars": 736,
+      "model_responses_chars": 4540,
+      "tool_execution_steps": 19,
+      "tool_calls_count": 20,
+      "model_used": "gemini-3.5-flash",
+      "raw_model_detected": "gemini-3.5-flash",
+      "input_tokens": 11693.684210526317,
+      "output_tokens": 1194.7368421052631,
+      "input_cost": 0.0008770263157894737,
+      "output_cost": 0.00035842105263157893,
+      "total_cost": 0.0012354473684210525,
+      "logs": []
+    },
+    {
+      "id": "f54a3dd7-9066-4c07-a94c-cc5e8d50b38b",
+      "start_time": "2026-06-26T10:10:35Z",
+      "end_time": "2026-06-26T10:11:53Z",
+      "duration_sec": 78.0,
+      "total_steps": 24,
+      "step_types": {
+        "USER_INPUT": 1,
+        "CONVERSATION_HISTORY": 1,
+        "PLANNER_RESPONSE": 11,
+        "VIEW_FILE": 8,
+        "CHECKPOINT": 1,
+        "CODE_ACTION": 1,
+        "GENERIC": 1
+      },
+      "source_counts": {
+        "USER_EXPLICIT": 1,
+        "SYSTEM": 2,
+        "MODEL": 21
+      },
+      "user_prompts_chars": 773,
+      "model_responses_chars": 3422,
+      "tool_execution_steps": 10,
+      "tool_calls_count": 10,
+      "model_used": "gemini-3.5-flash",
+      "raw_model_detected": "gemini-3.5-flash",
+      "input_tokens": 7203.421052631579,
+      "output_tokens": 900.5263157894738,
+      "input_cost": 0.0005402565789473685,
+      "output_cost": 0.0002701578947368421,
+      "total_cost": 0.0008104144736842105,
+      "logs": []
+    }
+  ]
+}
