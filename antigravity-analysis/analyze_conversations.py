@@ -186,9 +186,12 @@ for bdir in sorted(brain_dirs):
     total_input_tokens = input_prompt_tokens + system_prompt_tokens + tool_overhead_tokens
     total_output_tokens = model_responses_chars / 3.8
     
-    # Cost calculation: $0.075/M tokens for input, $0.30/M tokens for output
-    input_cost = (total_input_tokens / 1000000.0) * 0.075
-    output_cost = (total_output_tokens / 1000000.0) * 0.30
+    # Cost calculation: $1.50/M tokens for input, $9.00/M tokens for output, with 90% discount ($0.15/M) for cached system prompt
+    input_prompt_cost = (input_prompt_tokens / 1000000.0) * 1.50
+    system_prompt_cost = (system_prompt_tokens / 1000000.0) * 0.15  # 90% caching discount
+    tool_overhead_cost = (tool_overhead_tokens / 1000000.0) * 1.50
+    input_cost = input_prompt_cost + system_prompt_cost + tool_overhead_cost
+    output_cost = (total_output_tokens / 1000000.0) * 9.00
     total_cost = input_cost + output_cost
     
     conversations.append({
@@ -238,6 +241,8 @@ agg_output_tokens = 0
 agg_steps = 0
 agg_tool_calls = 0
 agg_tool_steps = 0
+agg_input_cost = 0.0
+agg_output_cost = 0.0
 agg_cost = 0.0
 
 for idx, c in enumerate(conversations):
@@ -260,6 +265,8 @@ for idx, c in enumerate(conversations):
     agg_steps += c['total_steps']
     agg_tool_calls += c['tool_calls_count']
     agg_tool_steps += c['tool_execution_steps']
+    agg_input_cost += c['input_cost']
+    agg_output_cost += c['output_cost']
     agg_cost += c['total_cost']
 
 print("\n" + "="*80)
@@ -272,5 +279,5 @@ print(f"Total Tool Calls        : {agg_tool_calls}")
 print(f"Total Input Characters  : {agg_input_chars:,}")
 print(f"Total Output Characters : {agg_output_chars:,}")
 print(f"Total Estimated Tokens  : Input: {agg_input_tokens:,.1f} | Output: {agg_output_tokens:,.1f} (Total: {agg_input_tokens+agg_output_tokens:,.1f})")
-print(f"Total Estimated Cost    : Input: ${agg_input_tokens/1e6*0.075:.4f} | Output: ${agg_output_tokens/1e6*0.30:.4f} | Total: ${agg_cost:.4f}")
+print(f"Total Estimated Cost    : Input: ${agg_input_cost:.4f} | Output: ${agg_output_cost:.4f} | Total: ${agg_cost:.4f}")
 print("="*80)
