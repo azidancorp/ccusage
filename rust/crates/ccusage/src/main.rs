@@ -11,6 +11,7 @@ mod date_utils;
 mod fast;
 mod home;
 mod logger;
+mod model_aliases;
 mod output;
 mod pricing;
 mod progress;
@@ -23,31 +24,36 @@ pub(crate) use adapter::claude::{
     chunk_file_indexes_by_size, collect_files_with_extension, collect_usage_files,
     filter_loaded_entries_by_date, load_daily_summaries, load_entries,
 };
+pub(crate) use adapter::read_files_parallel;
 pub(crate) use blocks::{
     block_json, calculate_burn_rate, filter_blocks_by_date, format_remaining_time,
     identify_session_blocks, print_active_block_detail, print_blocks_table, sort_blocks,
 };
-pub(crate) use cost::{calculate_cost, calculate_cost_for_usage};
+pub(crate) use cost::{
+    calculate_cost, calculate_cost_for_usage, missing_pricing_model_for_candidates,
+    missing_pricing_model_for_token_total, missing_pricing_model_for_usage,
+};
 pub(crate) use date_utils::*;
 pub(crate) use logger::{debug_log, log_level};
 pub(crate) use output::{
     format_currency, format_models_multiline, format_number, group_project_output, json_float,
-    print_json_or_jq, print_usage_table, session_summary_json, summary_json, totals_json,
+    print_json_or_jq, print_missing_pricing_warnings, print_missing_pricing_warnings_for_models,
+    print_usage_table, session_summary_json, should_use_compact_layout, summary_json, totals_json,
     wants_json,
 };
 pub(crate) use project_names::{format_project_name, parse_project_aliases, short_model_name};
 pub(crate) use summary::{
-    filter_and_sort_summaries, sort_summaries, summarize_by_key, summarize_summaries_by_bucket,
-    week_start, BucketKind, SessionAccumulator,
+    BucketKind, SessionAccumulator, filter_and_sort_summaries, sort_summaries, summarize_by_key,
+    summarize_summaries_by_bucket, week_start,
 };
 pub(crate) use types::*;
 pub(crate) use utils::{
     apply_total_token_fallback, json_value_u64, non_empty_json_string, total_usage_tokens,
 };
 
-use ccusage_terminal::{terminal_width, TerminalStyle};
 pub(crate) use ccusage_terminal::{Align, Color, SimpleTable};
-use cli::{AgentCommandArgs, AgentReportKind, Cli, Command};
+use ccusage_terminal::{TerminalStyle, terminal_width};
+use cli::{AgentCommandArgs, AgentReportKind, Command};
 use pricing::PricingMap;
 
 #[cfg(all(target_os = "linux", target_env = "musl"))]
@@ -87,22 +93,20 @@ fn cli_error(message: impl Into<String>) -> CliError {
     CliError(message.into())
 }
 
-impl From<&cli::SharedArgs> for TerminalStyle {
-    fn from(shared: &cli::SharedArgs) -> Self {
-        Self {
-            color: shared.color,
-            log_level: log_level(),
-            no_color: shared.no_color,
-        }
+fn terminal_style(shared: &cli::SharedArgs) -> TerminalStyle {
+    TerminalStyle {
+        color: shared.color,
+        log_level: log_level(),
+        no_color: shared.no_color,
     }
 }
 
 fn color(shared: &cli::SharedArgs, value: impl AsRef<str>, color: Color) -> String {
-    ccusage_terminal::color(shared, value, color)
+    ccusage_terminal::color(terminal_style(shared), value, color)
 }
 
 fn print_box_title(title: &str, shared: &cli::SharedArgs) {
-    ccusage_terminal::print_box_title(title, shared);
+    ccusage_terminal::print_box_title(title, terminal_style(shared));
 }
 
 trait Context<T> {
@@ -119,7 +123,7 @@ where
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = cli::parse();
     match cli.command {
         Some(Command::All(args)) => adapter::all::run(args),
         Some(Command::Daily(args)) => commands::run_daily(args),
@@ -158,14 +162,9 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashMap,
-        env, fs,
-        path::PathBuf,
-        sync::{Arc, Mutex},
-    };
+    use std::{collections::HashMap, fs, sync::Arc};
 
-    use ccusage_test_support::{fs_fixture, Fixture};
+    use ccusage_test_support::{EnvVarGuard, fs_fixture};
     use serde_json::json;
 
     use super::*;
@@ -173,18 +172,6 @@ mod tests {
         cli::{CostMode, SharedArgs, SortOrder, WeekDay},
         cost::tiered_cost,
     };
-
-    static CLAUDE_CONFIG_DIR_LOCK: Mutex<()> = Mutex::new(());
-
-    fn temp_claude_dir(name: &str) -> PathBuf {
-        let mut path = env::temp_dir();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        path.push(format!("ccusage-{name}-{nanos}"));
-        path
-    }
 
     #[test]
     fn formats_numbers_with_commas() {
@@ -224,15 +211,20 @@ mod tests {
 
     #[test]
     fn balances_file_chunks_by_size() {
-        let fixture = Fixture::new();
+        let fixture = fs_fixture!({
+            "large-a.jsonl": "x".repeat(100),
+            "small-a.jsonl": "x",
+            "small-b.jsonl": "x",
+            "large-b.jsonl": "x".repeat(100),
+        });
         let files = [
-            ("large-a.jsonl", 100),
-            ("small-a.jsonl", 1),
-            ("small-b.jsonl", 1),
-            ("large-b.jsonl", 100),
+            "large-a.jsonl",
+            "small-a.jsonl",
+            "small-b.jsonl",
+            "large-b.jsonl",
         ]
         .into_iter()
-        .map(|(name, size)| fixture.write_file(name, "x".repeat(size)))
+        .map(|name| fixture.path(name))
         .collect::<Vec<_>>();
 
         let chunks = chunk_file_indexes_by_size(&files, 2);
@@ -298,41 +290,28 @@ mod tests {
         .unwrap();
 
         assert_eq!(format_rfc3339_millis(timestamp), "2026-05-11T12:34:56.789Z");
-        assert!(adapter::claude::timestamp_from_line(
-            r#"{"timestamp": "2026-05-11T12:34:56.789Z"}"#
-        )
-        .is_none());
+        assert!(
+            adapter::claude::timestamp_from_line(r#"{"timestamp": "2026-05-11T12:34:56.789Z"}"#)
+                .is_none()
+        );
     }
 
     #[test]
     fn keeps_most_complete_duplicate_usage_entry() {
-        let _guard = CLAUDE_CONFIG_DIR_LOCK.lock().unwrap();
-        let claude_dir = temp_claude_dir("dedupe");
-        let session_dir = claude_dir.join("projects/project1/session1");
-        fs::create_dir_all(&session_dir).unwrap();
-        fs::write(
-            session_dir.join("chat.jsonl"),
-            [
+        let fixture = fs_fixture!({
+            "projects/project1/session1/chat.jsonl": [
                 r#"{"timestamp":"2025-01-10T10:00:00.000Z","message":{"id":"msg_123","model":"claude-opus-4-6","usage":{"input_tokens":100,"output_tokens":25,"cache_creation_input_tokens":10,"cache_read_input_tokens":5}},"requestId":"req_456","costUSD":0.001}"#,
                 r#"{"timestamp":"2025-01-10T10:00:01.000Z","message":{"id":"msg_123","model":"claude-opus-4-6","usage":{"input_tokens":100,"output_tokens":250,"cache_creation_input_tokens":10,"cache_read_input_tokens":5,"speed":"standard"}},"requestId":"req_456","costUSD":0.01}"#,
             ]
             .join("\n"),
-        )
-        .unwrap();
+        });
 
-        let previous = env::var("CLAUDE_CONFIG_DIR").ok();
-        env::set_var("CLAUDE_CONFIG_DIR", &claude_dir);
+        let _env = EnvVarGuard::set("CLAUDE_CONFIG_DIR", fixture.root());
         let shared = SharedArgs {
             mode: CostMode::Display,
             ..SharedArgs::default()
         };
         let entries = load_entries(&shared, None).unwrap();
-        if let Some(previous) = previous {
-            env::set_var("CLAUDE_CONFIG_DIR", previous);
-        } else {
-            env::remove_var("CLAUDE_CONFIG_DIR");
-        }
-        fs::remove_dir_all(&claude_dir).unwrap();
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].data.message.usage.input_tokens, 100);
@@ -342,33 +321,20 @@ mod tests {
 
     #[test]
     fn dedupes_usage_entries_by_message_id_without_request_id() {
-        let _guard = CLAUDE_CONFIG_DIR_LOCK.lock().unwrap();
-        let claude_dir = temp_claude_dir("dedupe-message-id");
-        let session_dir = claude_dir.join("projects/project1/session1");
-        fs::create_dir_all(&session_dir).unwrap();
-        fs::write(
-            session_dir.join("chat.jsonl"),
-            [
+        let fixture = fs_fixture!({
+            "projects/project1/session1/chat.jsonl": [
                 r#"{"timestamp":"2025-01-10T10:00:00.000Z","message":{"id":"msg_123","model":"claude-opus-4-6","usage":{"input_tokens":100,"output_tokens":25,"cache_creation_input_tokens":10,"cache_read_input_tokens":5}},"costUSD":0.001}"#,
                 r#"{"timestamp":"2025-01-10T10:00:01.000Z","message":{"id":"msg_123","model":"claude-opus-4-6","usage":{"input_tokens":100,"output_tokens":250,"cache_creation_input_tokens":10,"cache_read_input_tokens":5,"speed":"standard"}},"costUSD":0.01}"#,
             ]
             .join("\n"),
-        )
-        .unwrap();
+        });
 
-        let previous = env::var("CLAUDE_CONFIG_DIR").ok();
-        env::set_var("CLAUDE_CONFIG_DIR", &claude_dir);
+        let _env = EnvVarGuard::set("CLAUDE_CONFIG_DIR", fixture.root());
         let shared = SharedArgs {
             mode: CostMode::Display,
             ..SharedArgs::default()
         };
         let entries = load_entries(&shared, None).unwrap();
-        if let Some(previous) = previous {
-            env::set_var("CLAUDE_CONFIG_DIR", previous);
-        } else {
-            env::remove_var("CLAUDE_CONFIG_DIR");
-        }
-        fs::remove_dir_all(&claude_dir).unwrap();
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].data.message.usage.output_tokens, 250);
@@ -377,29 +343,16 @@ mod tests {
 
     #[test]
     fn accepts_projects_directory_in_claude_config_dir() {
-        let _guard = CLAUDE_CONFIG_DIR_LOCK.lock().unwrap();
-        let claude_dir = temp_claude_dir("projects-env");
-        let session_dir = claude_dir.join("projects/project1/session1");
-        fs::create_dir_all(&session_dir).unwrap();
-        fs::write(
-            session_dir.join("chat.jsonl"),
-            r#"{"timestamp":"2025-01-10T10:00:00.000Z","message":{"id":"msg_123","model":"claude-opus-4-6","usage":{"input_tokens":100,"output_tokens":25,"cache_creation_input_tokens":10,"cache_read_input_tokens":5}},"costUSD":0.001}"#,
-        )
-        .unwrap();
+        let fixture = fs_fixture!({
+            "projects/project1/session1/chat.jsonl": r#"{"timestamp":"2025-01-10T10:00:00.000Z","message":{"id":"msg_123","model":"claude-opus-4-6","usage":{"input_tokens":100,"output_tokens":25,"cache_creation_input_tokens":10,"cache_read_input_tokens":5}},"costUSD":0.001}"#,
+        });
 
-        let previous = env::var("CLAUDE_CONFIG_DIR").ok();
-        env::set_var("CLAUDE_CONFIG_DIR", claude_dir.join("projects"));
+        let _env = EnvVarGuard::set("CLAUDE_CONFIG_DIR", fixture.path("projects"));
         let shared = SharedArgs {
             mode: CostMode::Display,
             ..SharedArgs::default()
         };
         let entries = load_entries(&shared, None).unwrap();
-        if let Some(previous) = previous {
-            env::set_var("CLAUDE_CONFIG_DIR", previous);
-        } else {
-            env::remove_var("CLAUDE_CONFIG_DIR");
-        }
-        fs::remove_dir_all(&claude_dir).unwrap();
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].project.as_ref(), "project1");
@@ -407,31 +360,18 @@ mod tests {
 
     #[test]
     fn loads_daily_summaries_like_loaded_entry_aggregation() {
-        let _guard = CLAUDE_CONFIG_DIR_LOCK.lock().unwrap();
-        let claude_dir = temp_claude_dir("daily-fast-path");
-        let project_a_dir = claude_dir.join("projects/project-a/session-a");
-        let project_b_dir = claude_dir.join("projects/project-b/session-b");
-        fs::create_dir_all(&project_a_dir).unwrap();
-        fs::create_dir_all(&project_b_dir).unwrap();
-        fs::write(
-            project_a_dir.join("chat.jsonl"),
-            [
+        let fixture = fs_fixture!({
+            "projects/project-a/session-a/chat.jsonl": [
                 r#"{"timestamp":"2025-01-10T09:59:00.000Z","version":"not-semver","message":{"id":"bad","model":"claude-opus-4-6","usage":{"input_tokens":999,"output_tokens":999,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}},"requestId":"bad","costUSD":9}"#,
                 r#"{"timestamp":"2025-01-10T10:00:00.000Z","version":"1.2.3","sessionId":"session-a","message":{"id":"msg_123","model":"claude-opus-4-6","usage":{"input_tokens":100,"output_tokens":25,"cache_creation_input_tokens":10,"cache_read_input_tokens":5}},"requestId":"req_456","costUSD":0.001}"#,
                 r#"{"timestamp":"2025-01-10T10:00:01.000Z","version":"1.2.3","sessionId":"session-a","message":{"id":"msg_123","model":"claude-opus-4-6","usage":{"input_tokens":100,"output_tokens":250,"cache_creation_input_tokens":10,"cache_read_input_tokens":5,"speed":"standard"}},"requestId":"req_456","costUSD":0.01}"#,
                 r#"{"timestamp":"2025-01-11T11:00:00.000Z","version":"1.2.3","sessionId":"session-a","message":{"id":"msg_789","model":"<synthetic>","usage":{"input_tokens":7,"output_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}},"requestId":"req_789","costUSD":0.02}"#,
             ]
             .join("\n"),
-        )
-        .unwrap();
-        fs::write(
-            project_b_dir.join("chat.jsonl"),
-            r#"{"timestamp":"2025-01-10T12:00:00.000Z","version":"1.2.3","sessionId":"session-b","message":{"id":"msg_b","model":"claude-sonnet-4-20250514","usage":{"input_tokens":20,"output_tokens":30,"cache_creation_input_tokens":4,"cache_read_input_tokens":2}},"requestId":"req_b","costUSD":0.04}"#,
-        )
-        .unwrap();
+            "projects/project-b/session-b/chat.jsonl": r#"{"timestamp":"2025-01-10T12:00:00.000Z","version":"1.2.3","sessionId":"session-b","message":{"id":"msg_b","model":"claude-sonnet-4-20250514","usage":{"input_tokens":20,"output_tokens":30,"cache_creation_input_tokens":4,"cache_read_input_tokens":2}},"requestId":"req_b","costUSD":0.04}"#,
+        });
 
-        let previous = env::var("CLAUDE_CONFIG_DIR").ok();
-        env::set_var("CLAUDE_CONFIG_DIR", &claude_dir);
+        let _env = EnvVarGuard::set("CLAUDE_CONFIG_DIR", fixture.root());
         let shared = SharedArgs {
             mode: CostMode::Display,
             timezone: Some("UTC".to_string()),
@@ -440,12 +380,6 @@ mod tests {
         let entries = load_entries(&shared, None).unwrap();
         let daily = load_daily_summaries(&shared, None, false).unwrap();
         let grouped_daily = load_daily_summaries(&shared, None, true).unwrap();
-        if let Some(previous) = previous {
-            env::set_var("CLAUDE_CONFIG_DIR", previous);
-        } else {
-            env::remove_var("CLAUDE_CONFIG_DIR");
-        }
-        fs::remove_dir_all(&claude_dir).unwrap();
 
         let expected_daily = summarize_by_key(
             &entries,
@@ -481,41 +415,23 @@ mod tests {
 
     #[test]
     fn keeps_nested_agent_progress_in_daily_model_order() {
-        let _guard = CLAUDE_CONFIG_DIR_LOCK.lock().unwrap();
-        let claude_dir = temp_claude_dir("daily-agent-progress");
-        let session_dir = claude_dir.join("projects/project-a/session-a");
-        let subagent_dir = session_dir.join("subagents");
-        fs::create_dir_all(&subagent_dir).unwrap();
-        fs::write(
-            claude_dir.join("projects/project-a/session-a.jsonl"),
-            [
+        let fixture = fs_fixture!({
+            "projects/project-a/session-a.jsonl": [
                 r#"{"timestamp":"2026-03-10T06:00:00.000Z","version":"1.2.3","sessionId":"session-a","message":{"id":"msg_fast","model":"claude-opus-4-6","role":"assistant","usage":{"input_tokens":10,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"speed":"fast"}},"requestId":"req_fast","costUSD":0.03}"#,
                 r#"{"sessionId":"session-a","version":"1.2.3","type":"progress","data":{"message":{"type":"assistant","timestamp":"2026-03-10T06:00:01.000Z","message":{"model":"claude-haiku-4-5-20251001","id":"msg_haiku","type":"message","role":"assistant","content":[],"usage":{"input_tokens":20,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}},"requestId":"req_haiku","uuid":"nested"}},"timestamp":"2026-03-10T06:00:01.001Z"}"#,
                 r#"{"timestamp":"2026-03-10T06:00:02.000Z","version":"1.2.3","sessionId":"session-a","message":{"id":"msg_opus","model":"claude-opus-4-6","role":"assistant","usage":{"input_tokens":30,"output_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}},"requestId":"req_opus","costUSD":0.09}"#,
             ]
             .join("\n"),
-        )
-        .unwrap();
-        fs::write(
-            subagent_dir.join("agent-a.jsonl"),
-            r#"{"timestamp":"2026-03-10T06:00:01.000Z","version":"1.2.3","sessionId":"session-a","message":{"id":"msg_haiku","model":"claude-haiku-4-5-20251001","role":"assistant","usage":{"input_tokens":20,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}},"requestId":"req_haiku","costUSD":0.06}"#,
-        )
-        .unwrap();
+            "projects/project-a/session-a/subagents/agent-a.jsonl": r#"{"timestamp":"2026-03-10T06:00:01.000Z","version":"1.2.3","sessionId":"session-a","message":{"id":"msg_haiku","model":"claude-haiku-4-5-20251001","role":"assistant","usage":{"input_tokens":20,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}},"requestId":"req_haiku","costUSD":0.06}"#,
+        });
 
-        let previous = env::var("CLAUDE_CONFIG_DIR").ok();
-        env::set_var("CLAUDE_CONFIG_DIR", &claude_dir);
+        let _env = EnvVarGuard::set("CLAUDE_CONFIG_DIR", fixture.root());
         let shared = SharedArgs {
             mode: CostMode::Display,
             timezone: Some("UTC".to_string()),
             ..SharedArgs::default()
         };
         let daily = load_daily_summaries(&shared, None, false).unwrap();
-        if let Some(previous) = previous {
-            env::set_var("CLAUDE_CONFIG_DIR", previous);
-        } else {
-            env::remove_var("CLAUDE_CONFIG_DIR");
-        }
-        fs::remove_dir_all(&claude_dir).unwrap();
 
         assert_eq!(daily.len(), 1);
         assert_eq!(
@@ -531,24 +447,12 @@ mod tests {
 
     #[test]
     fn uses_direct_subagent_cost_for_duplicate_daily_agent_progress() {
-        let _guard = CLAUDE_CONFIG_DIR_LOCK.lock().unwrap();
-        let claude_dir = temp_claude_dir("daily-agent-progress-cost");
-        let session_dir = claude_dir.join("projects/project-a/session-a");
-        let subagent_dir = session_dir.join("subagents");
-        fs::create_dir_all(&subagent_dir).unwrap();
-        fs::write(
-            claude_dir.join("projects/project-a/session-a.jsonl"),
-            r#"{"sessionId":"session-a","version":"1.2.3","type":"progress","data":{"message":{"type":"assistant","timestamp":"2026-03-10T06:00:01.000Z","message":{"model":"claude-haiku-4-5-20251001","id":"msg_haiku","type":"message","role":"assistant","content":[],"usage":{"input_tokens":20,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}},"requestId":"req_haiku","uuid":"nested"}},"timestamp":"2026-03-10T06:00:01.001Z"}"#,
-        )
-        .unwrap();
-        fs::write(
-            subagent_dir.join("agent-a.jsonl"),
-            r#"{"timestamp":"2026-03-10T06:00:01.000Z","version":"1.2.3","sessionId":"session-a","message":{"id":"msg_haiku","model":"claude-haiku-4-5-20251001","role":"assistant","usage":{"input_tokens":20,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}},"requestId":"req_haiku","costUSD":0.06}"#,
-        )
-        .unwrap();
+        let fixture = fs_fixture!({
+            "projects/project-a/session-a.jsonl": r#"{"sessionId":"session-a","version":"1.2.3","type":"progress","data":{"message":{"type":"assistant","timestamp":"2026-03-10T06:00:01.000Z","message":{"model":"claude-haiku-4-5-20251001","id":"msg_haiku","type":"message","role":"assistant","content":[],"usage":{"input_tokens":20,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}},"requestId":"req_haiku","uuid":"nested"}},"timestamp":"2026-03-10T06:00:01.001Z"}"#,
+            "projects/project-a/session-a/subagents/agent-a.jsonl": r#"{"timestamp":"2026-03-10T06:00:01.000Z","version":"1.2.3","sessionId":"session-a","message":{"id":"msg_haiku","model":"claude-haiku-4-5-20251001","role":"assistant","usage":{"input_tokens":20,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}},"requestId":"req_haiku","costUSD":0.06}"#,
+        });
 
-        let previous = env::var("CLAUDE_CONFIG_DIR").ok();
-        env::set_var("CLAUDE_CONFIG_DIR", &claude_dir);
+        let _env = EnvVarGuard::set("CLAUDE_CONFIG_DIR", fixture.root());
         let shared = SharedArgs {
             mode: CostMode::Display,
             timezone: Some("UTC".to_string()),
@@ -556,12 +460,6 @@ mod tests {
         };
         let entries = load_entries(&shared, None).unwrap();
         let daily = load_daily_summaries(&shared, None, false).unwrap();
-        if let Some(previous) = previous {
-            env::set_var("CLAUDE_CONFIG_DIR", previous);
-        } else {
-            env::remove_var("CLAUDE_CONFIG_DIR");
-        }
-        fs::remove_dir_all(&claude_dir).unwrap();
 
         let expected_daily = summarize_by_key(
             &entries,
@@ -577,21 +475,17 @@ mod tests {
 
     #[test]
     fn loads_codex_token_count_events() {
-        let codex_dir = temp_claude_dir("codex");
-        let sessions_dir = codex_dir.join("sessions");
-        fs::create_dir_all(&sessions_dir).unwrap();
-        fs::write(
-            sessions_dir.join("codex-session.jsonl"),
-            [
+        let fixture = fs_fixture!({
+            "sessions/codex-session.jsonl": [
                 r#"{"timestamp":"2026-01-02T00:00:00.000Z","type":"turn_context","payload":{"model":"gpt-5"}}"#,
                 r#"{"timestamp":"2026-01-02T00:00:01.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":10,"output_tokens":50,"reasoning_output_tokens":0,"total_tokens":150},"model":"gpt-5"}}}"#,
             ]
             .join("\n"),
-        )
-        .unwrap();
+        });
 
-        let events = adapter::codex::load_codex_events_from_directory(&sessions_dir, true).unwrap();
-        fs::remove_dir_all(&codex_dir).unwrap();
+        let events =
+            adapter::codex::load_codex_events_from_directory(&fixture.path("sessions"), true)
+                .unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].session_id, "codex-session");
@@ -605,33 +499,25 @@ mod tests {
 
     #[test]
     fn loads_codex_token_count_events_in_parallel() {
-        let codex_dir = temp_claude_dir("codex-parallel");
-        let sessions_dir = codex_dir.join("sessions");
-        fs::create_dir_all(&sessions_dir).unwrap();
-        fs::write(
-            sessions_dir.join("session-a.jsonl"),
-            [
+        let fixture = fs_fixture!({
+            "sessions/session-a.jsonl": [
                 r#"{"timestamp":"2026-01-02T00:00:00.000Z","type":"turn_context","payload":{"model":"gpt-5"}}"#,
                 r#"{"timestamp":"2026-01-02T00:00:01.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":10,"output_tokens":50,"reasoning_output_tokens":0,"total_tokens":150},"model":"gpt-5"}}}"#,
             ]
             .join("\n"),
-        )
-        .unwrap();
-        fs::write(
-            sessions_dir.join("session-b.jsonl"),
-            [
+            "sessions/session-b.jsonl": [
                 r#"{"timestamp":"2026-01-02T00:01:00.000Z","type":"turn_context","payload":{"model":"gpt-5-mini"}}"#,
                 r#"{"timestamp":"2026-01-02T00:01:01.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":40,"cached_input_tokens":4,"output_tokens":20,"reasoning_output_tokens":2,"total_tokens":62},"model":"gpt-5-mini"}}}"#,
             ]
             .join("\n"),
-        )
-        .unwrap();
+        });
 
         let single_thread_events =
-            adapter::codex::load_codex_events_from_directory(&sessions_dir, true).unwrap();
+            adapter::codex::load_codex_events_from_directory(&fixture.path("sessions"), true)
+                .unwrap();
         let parallel_events =
-            adapter::codex::load_codex_events_from_directory(&sessions_dir, false).unwrap();
-        fs::remove_dir_all(&codex_dir).unwrap();
+            adapter::codex::load_codex_events_from_directory(&fixture.path("sessions"), false)
+                .unwrap();
 
         assert_eq!(parallel_events.len(), 2);
         assert_eq!(parallel_events, single_thread_events);
@@ -657,7 +543,7 @@ mod tests {
         let report = adapter::codex::report_json(
             &events,
             AgentReportKind::Daily,
-            None,
+            Some("UTC"),
             &pricing,
             cli::CodexSpeed::Standard,
         )
@@ -665,15 +551,17 @@ mod tests {
 
         assert_eq!(report["daily"][0]["date"], "2026-01-02");
         assert_eq!(report["daily"][0]["inputTokens"], 90);
-        assert_eq!(report["daily"][0]["cachedInputTokens"], 10);
+        assert_eq!(report["daily"][0]["cacheCreationTokens"], 0);
+        assert_eq!(report["daily"][0]["cacheReadTokens"], 10);
         assert_eq!(report["daily"][0]["outputTokens"], 50);
         assert_eq!(report["daily"][0]["reasoningOutputTokens"], 0);
         assert_eq!(report["daily"][0]["totalTokens"], 150);
         assert_eq!(report["daily"][0]["models"]["gpt-5"]["inputTokens"], 90);
         assert_eq!(
-            report["daily"][0]["models"]["gpt-5"]["cachedInputTokens"],
-            10
+            report["daily"][0]["models"]["gpt-5"]["cacheCreationTokens"],
+            0
         );
+        assert_eq!(report["daily"][0]["models"]["gpt-5"]["cacheReadTokens"], 10);
         assert_eq!(report["daily"][0]["costUSD"], json!(0.00061375));
         assert_eq!(report["totals"]["costUSD"], json!(0.00061375));
     }
@@ -789,23 +677,17 @@ mod tests {
 
     #[test]
     fn loads_amp_thread_usage_events() {
-        let amp_dir = temp_claude_dir("amp");
-        let threads_dir = amp_dir.join("threads");
-        fs::create_dir_all(&threads_dir).unwrap();
-        fs::write(
-            threads_dir.join("thread.json"),
-            r#"{"id":"thread-a","messages":[{"role":"assistant","messageId":2,"usage":{"cacheCreationInputTokens":20,"cacheReadInputTokens":10}}],"usageLedger":{"events":[{"id":"event-a","timestamp":"2026-05-01T01:02:03.000Z","model":"claude-sonnet-4-20250514","credits":1.25,"tokens":{"input":100,"output":50},"toMessageId":2}]}}"#,
-        )
-        .unwrap();
+        let fixture = fs_fixture!({
+            "threads/thread.json": r#"{"id":"thread-a","messages":[{"role":"assistant","messageId":2,"usage":{"cacheCreationInputTokens":20,"cacheReadInputTokens":10}}],"usageLedger":{"events":[{"id":"event-a","timestamp":"2026-05-01T01:02:03.000Z","model":"claude-sonnet-4-20250514","credits":1.25,"tokens":{"input":100,"output":50},"toMessageId":2}]}}"#,
+        });
 
         let entries = adapter::amp::read_thread_file(
-            &threads_dir.join("thread.json"),
+            &fixture.path("threads/thread.json"),
             parse_tz(Some("UTC")).as_ref(),
             CostMode::Display,
             None,
         )
         .unwrap();
-        fs::remove_dir_all(&amp_dir).unwrap();
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].date, "2026-05-01");
@@ -838,6 +720,7 @@ mod tests {
                         cache_creation_input_tokens: 20,
                         cache_read_input_tokens: 10,
                         speed: None,
+                        cache_creation: None,
                     },
                     model: Some("claude-sonnet-4-20250514".to_string()),
                     id: Some("event-a".to_string()),
@@ -845,6 +728,7 @@ mod tests {
                 cost_usd: None,
                 request_id: None,
                 is_api_error_message: None,
+                is_sidechain: None,
             },
             timestamp: parse_ts_timestamp("2026-05-01T01:02:03.000Z").unwrap(),
             date: "2026-05-01".to_string(),
@@ -857,6 +741,7 @@ mod tests {
             message_count: None,
             model: Some("claude-sonnet-4-20250514".to_string()),
             usage_limit_reset_time: None,
+            missing_pricing_model: None,
         };
 
         let rows = adapter::amp::summarize_entries(&[entry], AgentReportKind::Daily).unwrap();
@@ -875,25 +760,21 @@ mod tests {
 
     #[test]
     fn loads_pi_agent_jsonl_usage_entries() {
-        let pi_dir = temp_claude_dir("pi-agent");
-        let session_dir = pi_dir.join("sessions/project-a");
-        fs::create_dir_all(&session_dir).unwrap();
-        fs::write(
-            session_dir.join("prefix_session-a.jsonl"),
-            [
+        let fixture = fs_fixture!({
+            "sessions/project-a/prefix_session-a.jsonl": [
                 r#"{"type":"message","timestamp":"2026-04-22T01:02:02.000Z","message":{"role":"user","usage":{"input":999,"output":999}}}"#,
                 r#"{"type":"message","timestamp":"2026-04-22T01:02:03.000Z","message":{"role":"assistant","model":"gpt-5.4","usage":{"input":100,"output":50,"cacheRead":10,"cacheWrite":20,"totalTokens":180,"cost":{"total":0.05}}}}"#,
             ]
             .join("\n"),
-        )
-        .unwrap();
+        });
 
         let entries = adapter::pi::read_session_file(
-            &session_dir.join("prefix_session-a.jsonl"),
+            &fixture.path("sessions/project-a/prefix_session-a.jsonl"),
             parse_tz(Some("UTC")).as_ref(),
+            CostMode::Display,
+            None,
         )
         .unwrap();
-        fs::remove_dir_all(&pi_dir).unwrap();
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].date, "2026-04-22");
@@ -924,6 +805,7 @@ mod tests {
                         cache_creation_input_tokens: 20,
                         cache_read_input_tokens: 10,
                         speed: None,
+                        cache_creation: None,
                     },
                     model: Some("[pi] gpt-5.4".to_string()),
                     id: None,
@@ -931,6 +813,7 @@ mod tests {
                 cost_usd: Some(0.05),
                 request_id: None,
                 is_api_error_message: None,
+                is_sidechain: None,
             },
             timestamp: parse_ts_timestamp("2026-04-22T01:02:03.000Z").unwrap(),
             date: "2026-04-22".to_string(),
@@ -943,6 +826,7 @@ mod tests {
             message_count: None,
             model: Some("[pi] gpt-5.4".to_string()),
             usage_limit_reset_time: None,
+            missing_pricing_model: None,
         };
 
         let rows = adapter::pi::summarize_entries(&[entry], AgentReportKind::Daily).unwrap();
@@ -972,6 +856,7 @@ mod tests {
                         cache_creation_input_tokens: 20,
                         cache_read_input_tokens: 10,
                         speed: None,
+                        cache_creation: None,
                     },
                     model: Some("claude-sonnet-4-20250514".to_string()),
                     id: Some("msg-1".to_string()),
@@ -979,6 +864,7 @@ mod tests {
                 cost_usd: Some(0.02),
                 request_id: None,
                 is_api_error_message: None,
+                is_sidechain: None,
             },
             timestamp: parse_ts_timestamp("2026-01-02T00:00:00.000Z").unwrap(),
             date: "2026-01-02".to_string(),
@@ -991,6 +877,7 @@ mod tests {
             message_count: None,
             model: Some("claude-sonnet-4-20250514".to_string()),
             usage_limit_reset_time: None,
+            missing_pricing_model: None,
         };
 
         let report =
@@ -1021,10 +908,12 @@ mod tests {
             "2025-01-10T10:00:00.000Z"
         );
         assert!(adapter::claude::usage_limit_reset_time_from_line(line, Some(false)).is_none());
-        assert!(adapter::claude::usage_limit_reset_time_from_line(
-            r#"{"message":{"content":[{"text":"Claude AI usage limit reached|0"}]}}"#,
-            Some(true)
-        )
-        .is_none());
+        assert!(
+            adapter::claude::usage_limit_reset_time_from_line(
+                r#"{"message":{"content":[{"text":"Claude AI usage limit reached|0"}]}}"#,
+                Some(true)
+            )
+            .is_none()
+        );
     }
 }

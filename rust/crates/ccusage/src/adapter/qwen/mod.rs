@@ -4,9 +4,9 @@ mod paths;
 mod report;
 
 use crate::{
+    Result,
     cli::{AgentCommandArgs, AgentReportKind, SharedArgs},
     filter_loaded_entries_by_date, print_json_or_jq, print_usage_table, sort_summaries, wants_json,
-    Result,
 };
 
 pub(crate) use loader::load_entries;
@@ -30,6 +30,7 @@ pub(crate) fn run(args: AgentCommandArgs) -> Result<()> {
         return print_json_or_jq(
             report_from_rows(&rows, args.kind),
             args.shared.jq.as_deref(),
+            args.shared.no_cost,
         );
     }
     print_usage_table(
@@ -65,78 +66,30 @@ pub(crate) fn has_data() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        env,
-        ffi::OsString,
-        fs,
-        path::{Path, PathBuf},
-        sync::Mutex,
-    };
-
+    use ccusage_test_support::{EnvVarGuard, fs_fixture};
     use serde_json::json;
 
     use super::*;
-    use crate::cli::{CostMode, SharedArgs};
     use crate::UsageSummary;
-
-    static QWEN_DATA_DIR_LOCK: Mutex<()> = Mutex::new(());
-
-    struct QwenDataDirGuard {
-        previous: Option<OsString>,
-    }
-
-    impl QwenDataDirGuard {
-        fn set(path: &Path) -> Self {
-            let previous = env::var_os("QWEN_DATA_DIR");
-            env::set_var("QWEN_DATA_DIR", path);
-            Self { previous }
-        }
-    }
-
-    impl Drop for QwenDataDirGuard {
-        fn drop(&mut self) {
-            if let Some(previous) = self.previous.take() {
-                env::set_var("QWEN_DATA_DIR", previous);
-            } else {
-                env::remove_var("QWEN_DATA_DIR");
-            }
-        }
-    }
-
-    fn temp_qwen_dir(name: &str) -> PathBuf {
-        let mut path = env::temp_dir();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        path.push(format!("ccusage-qwen-{name}-{nanos}"));
-        path
-    }
+    use crate::cli::{CostMode, SharedArgs};
 
     #[test]
     fn loads_qwen_jsonl_usage_entries() {
-        let qwen_dir = temp_qwen_dir("entries");
-        let chat_dir = qwen_dir.join("projects/myProject/chats");
-        fs::create_dir_all(&chat_dir).unwrap();
-        fs::write(
-            chat_dir.join("chat-a.jsonl"),
-            [
+        let fixture = fs_fixture!({
+            "projects/myProject/chats/chat-a.jsonl": [
                 r#"{"type":"user","text":"hello"}"#,
                 r#"{"type":"assistant","model":"qwen3-coder-plus","timestamp":"2026-02-23T14:24:56.857Z","sessionId":"session-json","usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":50,"thoughtsTokenCount":10,"cachedContentTokenCount":5}}"#,
             ]
             .join("\n"),
-        )
-        .unwrap();
+        });
 
         let shared = SharedArgs {
             mode: CostMode::Display,
             timezone: Some("UTC".to_string()),
             ..SharedArgs::default()
         };
-        let _lock = QWEN_DATA_DIR_LOCK.lock().unwrap();
-        let _guard = QwenDataDirGuard::set(&qwen_dir);
+        let _guard = EnvVarGuard::set("QWEN_DATA_DIR", fixture.root());
         let entries = load_entries(&shared).unwrap();
-        fs::remove_dir_all(&qwen_dir).unwrap();
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].date, "2026-02-23");
@@ -151,26 +104,19 @@ mod tests {
 
     #[test]
     fn builds_qwen_daily_json_report_with_reasoning_in_total() {
-        let qwen_dir = temp_qwen_dir("report");
-        let chat_dir = qwen_dir.join("projects/myProject/chats");
-        fs::create_dir_all(&chat_dir).unwrap();
-        fs::write(
-            chat_dir.join("chat-a.jsonl"),
-            r#"{"type":"assistant","model":"qwen3-coder-plus","timestamp":"2026-02-23T14:24:56.857Z","sessionId":"session-json","usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":50,"thoughtsTokenCount":10,"cachedContentTokenCount":5}}"#,
-        )
-        .unwrap();
+        let fixture = fs_fixture!({
+            "projects/myProject/chats/chat-a.jsonl": r#"{"type":"assistant","model":"qwen3-coder-plus","timestamp":"2026-02-23T14:24:56.857Z","sessionId":"session-json","usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":50,"thoughtsTokenCount":10,"cachedContentTokenCount":5}}"#,
+        });
 
         let shared = SharedArgs {
             mode: CostMode::Display,
             timezone: Some("UTC".to_string()),
             ..SharedArgs::default()
         };
-        let _lock = QWEN_DATA_DIR_LOCK.lock().unwrap();
-        let _guard = QwenDataDirGuard::set(&qwen_dir);
+        let _guard = EnvVarGuard::set("QWEN_DATA_DIR", fixture.root());
         let entries = load_entries(&shared).unwrap();
         let rows = summarize_entries(&entries, AgentReportKind::Daily).unwrap();
         let report = report_from_rows(&rows, AgentReportKind::Daily);
-        fs::remove_dir_all(&qwen_dir).unwrap();
 
         assert_eq!(report["daily"][0]["date"], "2026-02-23");
         assert_eq!(report["daily"][0]["outputTokens"], 50);
@@ -209,6 +155,7 @@ mod tests {
             session_id: Some(session_id.to_string()),
             project_path: None,
             last_activity: Some(last_activity.to_string()),
+            first_activity: None,
             input_tokens: 0,
             output_tokens: 0,
             cache_creation_tokens: 0,

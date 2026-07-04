@@ -4,11 +4,11 @@ use std::{
 };
 
 use crate::{
+    LoadedEntry, ModelBreakdown, Result, TimestampMs, TokenCounts, UsageSummary,
     cli::{SharedArgs, SortOrder, WeekDay},
     cli_error,
     fast::{FxHashMap, FxHashSet},
-    format_date, format_naive_date, parse_iso_date, LoadedEntry, ModelBreakdown, Result,
-    TimestampMs, TokenCounts, UsageSummary,
+    format_naive_date, format_rfc3339_millis, parse_iso_date,
 };
 
 pub(crate) fn summarize_by_key<F, M>(
@@ -60,14 +60,16 @@ impl UsageAccumulator {
             *self.message_count.get_or_insert(0) += message_count;
         }
         if let Some(model) = &entry.model {
-            let index = if let Some(index) = self.breakdown_indexes.get(model.as_str()) {
+            let model = crate::model_aliases::resolve_model_name(model);
+            let index = if let Some(index) = self.breakdown_indexes.get(model.as_ref()) {
                 *index
             } else {
                 let index = self.breakdowns.len();
-                self.breakdown_indexes.insert(model.clone(), index);
-                self.models.push(model.clone());
+                let owned = model.into_owned();
+                self.breakdown_indexes.insert(owned.clone(), index);
+                self.models.push(owned.clone());
                 self.breakdowns.push(ModelBreakdown {
-                    model_name: model.clone(),
+                    model_name: owned,
                     ..ModelBreakdown::default()
                 });
                 index
@@ -75,10 +77,13 @@ impl UsageAccumulator {
             let breakdown = &mut self.breakdowns[index];
             breakdown.input_tokens += usage.input_tokens;
             breakdown.output_tokens += usage.output_tokens;
-            breakdown.cache_creation_tokens += usage.cache_creation_input_tokens;
+            breakdown.cache_creation_tokens += usage.cache_creation_token_count();
             breakdown.cache_read_tokens += usage.cache_read_input_tokens;
             breakdown.extra_total_tokens += entry.extra_total_tokens;
             breakdown.cost += entry.cost;
+            if entry.missing_pricing_model.is_some() {
+                breakdown.missing_pricing = true;
+            }
         }
     }
 
@@ -91,6 +96,7 @@ impl UsageAccumulator {
             session_id: None,
             project_path: None,
             last_activity: None,
+            first_activity: None,
             input_tokens: self.counts.input_tokens,
             output_tokens: self.counts.output_tokens,
             cache_creation_tokens: self.counts.cache_creation_tokens,
@@ -111,6 +117,7 @@ impl UsageAccumulator {
 pub(crate) struct SessionAccumulator {
     usage: UsageAccumulator,
     latest: Option<(TimestampMs, Arc<str>, Arc<str>)>,
+    earliest: Option<TimestampMs>,
     versions: BTreeSet<String>,
 }
 
@@ -128,19 +135,26 @@ impl SessionAccumulator {
                 Arc::clone(&entry.project_path),
             ));
         }
+        if self
+            .earliest
+            .is_none_or(|earliest| entry.timestamp < earliest)
+        {
+            self.earliest = Some(entry.timestamp);
+        }
         if let Some(version) = &entry.data.version {
             self.versions.insert(version.clone());
         }
     }
 
-    pub(crate) fn into_summary(self, timezone: Option<&str>) -> Result<UsageSummary> {
+    pub(crate) fn into_summary(self) -> Result<UsageSummary> {
         let Some((timestamp, session_id, project_path)) = self.latest else {
             return Err(cli_error("empty session group"));
         };
         let mut summary = self.usage.into_summary();
         summary.session_id = Some(session_id.to_string());
         summary.project_path = Some(project_path.to_string());
-        summary.last_activity = Some(format_date(timestamp, timezone));
+        summary.last_activity = Some(format_rfc3339_millis(timestamp));
+        summary.first_activity = self.earliest.map(format_rfc3339_millis);
         summary.versions = Some(self.versions.into_iter().collect());
         Ok(summary)
     }
@@ -190,6 +204,7 @@ fn aggregate_summaries(rows: &[&UsageSummary]) -> UsageSummary {
         session_id: None,
         project_path: None,
         last_activity: None,
+        first_activity: None,
         input_tokens: 0,
         output_tokens: 0,
         cache_creation_tokens: 0,
@@ -243,6 +258,7 @@ fn aggregate_summaries(rows: &[&UsageSummary]) -> UsageSummary {
             breakdown.cache_read_tokens += item.cache_read_tokens;
             breakdown.extra_total_tokens += item.extra_total_tokens;
             breakdown.cost += item.cost;
+            breakdown.missing_pricing |= item.missing_pricing;
         }
     }
     summary
@@ -300,8 +316,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        cli::{normalize_date_bound, SharedArgs, SortOrder},
-        format_rfc3339_millis, ModelBreakdown, TokenUsageRaw, UsageEntry, UsageMessage,
+        ModelBreakdown, TokenUsageRaw, UsageEntry, UsageMessage,
+        cli::{SharedArgs, SortOrder, normalize_date_bound},
+        format_rfc3339_millis,
     };
 
     #[test]
@@ -322,6 +339,7 @@ mod tests {
                 credits: Some(1.0),
                 message_count: Some(2),
                 version: Some("1.0.0"),
+                missing_pricing_model: None,
             }),
             loaded_entry(LoadedEntryFixture {
                 date: "2026-01-02",
@@ -337,7 +355,8 @@ mod tests {
                 cost: 0.25,
                 credits: Some(0.5),
                 message_count: Some(3),
-                version: Some("1.1.0"),
+                version: Some("1.0.1"),
+                missing_pricing_model: None,
             }),
             loaded_entry(LoadedEntryFixture {
                 date: "2026-01-03",
@@ -354,6 +373,7 @@ mod tests {
                 credits: None,
                 message_count: None,
                 version: None,
+                missing_pricing_model: None,
             }),
         ];
 
@@ -388,6 +408,7 @@ mod tests {
             credits: None,
             message_count: Some(1),
             version: Some("1.0.0"),
+            missing_pricing_model: None,
         }));
         accumulator.add_entry(&loaded_entry(LoadedEntryFixture {
             date: "2026-01-03",
@@ -404,9 +425,10 @@ mod tests {
             credits: None,
             message_count: Some(4),
             version: Some("1.1.0"),
+            missing_pricing_model: None,
         }));
 
-        let row = accumulator.into_summary(Some("UTC")).unwrap();
+        let row = accumulator.into_summary().unwrap();
 
         insta::assert_json_snapshot!(row);
     }
@@ -538,6 +560,85 @@ mod tests {
         assert_eq!(dashed, vec!["on-boundary", "after"]);
     }
 
+    #[test]
+    fn tracks_missing_pricing_in_model_breakdowns() {
+        let mut accumulator = SessionAccumulator::default();
+        accumulator.add_entry(&loaded_entry(LoadedEntryFixture {
+            date: "2026-01-02",
+            timestamp: 1_767_316_800_000,
+            session_id: "session-a",
+            project_path: "/workspace/project",
+            model: Some("claude-opus-4-9"),
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_creation_tokens: 10,
+            cache_read_tokens: 5,
+            extra_total_tokens: 0,
+            cost: 0.0,
+            credits: None,
+            message_count: Some(1),
+            version: Some("1.0.0"),
+            missing_pricing_model: Some("claude-opus-4-9"),
+        }));
+
+        let row = accumulator.into_summary().unwrap();
+
+        assert_eq!(row.model_breakdowns[0].model_name, "claude-opus-4-9");
+        assert!(row.model_breakdowns[0].missing_pricing);
+    }
+
+    #[test]
+    fn applies_model_aliases_to_model_breakdowns() {
+        let _aliases = crate::model_aliases::set_model_aliases_for_tests([
+            ("private-alpha", "gpt-5.5"),
+            ("another-private-alpha", "gpt-5.5"),
+        ]);
+        let mut accumulator = SessionAccumulator::default();
+        accumulator.add_entry(&loaded_entry(LoadedEntryFixture {
+            date: "2026-01-02",
+            timestamp: 1_767_316_800_000,
+            session_id: "session-a",
+            project_path: "/workspace/project",
+            model: Some("private-alpha"),
+            input_tokens: 20,
+            output_tokens: 5,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            extra_total_tokens: 0,
+            cost: 0.02,
+            credits: None,
+            message_count: Some(1),
+            version: Some("1.0.0"),
+            missing_pricing_model: None,
+        }));
+        accumulator.add_entry(&loaded_entry(LoadedEntryFixture {
+            date: "2026-01-02",
+            timestamp: 1_767_316_801_000,
+            session_id: "session-a",
+            project_path: "/workspace/project",
+            model: Some("another-private-alpha"),
+            input_tokens: 30,
+            output_tokens: 7,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            extra_total_tokens: 0,
+            cost: 0.03,
+            credits: None,
+            message_count: Some(1),
+            version: Some("1.0.0"),
+            missing_pricing_model: None,
+        }));
+
+        let row = accumulator.into_summary().unwrap();
+
+        assert_eq!(row.models_used, vec!["gpt-5.5"]);
+        assert_eq!(row.model_breakdowns.len(), 1);
+        assert_eq!(row.model_breakdowns[0].model_name, "gpt-5.5");
+        assert_eq!(row.model_breakdowns[0].input_tokens, 50);
+        assert_eq!(row.model_breakdowns[0].output_tokens, 12);
+        assert_eq!(row.model_breakdowns[0].cost, 0.05);
+    }
+
     struct LoadedEntryFixture {
         date: &'static str,
         timestamp: i64,
@@ -553,6 +654,7 @@ mod tests {
         credits: Option<f64>,
         message_count: Option<u64>,
         version: Option<&'static str>,
+        missing_pricing_model: Option<&'static str>,
     }
 
     fn loaded_entry(fixture: LoadedEntryFixture) -> LoadedEntry {
@@ -562,6 +664,7 @@ mod tests {
             cache_creation_input_tokens: fixture.cache_creation_tokens,
             cache_read_input_tokens: fixture.cache_read_tokens,
             speed: None,
+            cache_creation: None,
         };
         let timestamp = TimestampMs::from_millis(fixture.timestamp);
         LoadedEntry {
@@ -577,6 +680,7 @@ mod tests {
                 cost_usd: None,
                 request_id: None,
                 is_api_error_message: None,
+                is_sidechain: None,
             },
             timestamp,
             date: fixture.date.to_string(),
@@ -589,6 +693,7 @@ mod tests {
             message_count: fixture.message_count,
             model: fixture.model.map(str::to_string),
             usage_limit_reset_time: None,
+            missing_pricing_model: fixture.missing_pricing_model.map(str::to_string),
         }
     }
 
@@ -607,6 +712,7 @@ mod tests {
             session_id: None,
             project_path: None,
             last_activity: None,
+            first_activity: None,
             input_tokens: fixture.input_tokens,
             output_tokens: 10,
             cache_creation_tokens: 1,
@@ -624,6 +730,7 @@ mod tests {
                 cache_read_tokens: 2,
                 extra_total_tokens: 3,
                 cost: fixture.cost,
+                missing_pricing: false,
             }],
             project: None,
             versions: None,

@@ -1,10 +1,12 @@
 #![allow(dead_code)]
 
-use serde::de::DeserializeOwned;
-use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use std::collections::{BTreeMap, HashMap};
 
-use schemars::{r#gen::SchemaSettings, JsonSchema};
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
+use serde_json::{Map, Value, json};
+
+use schemars::{JsonSchema, r#gen::SchemaSettings};
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -342,6 +344,10 @@ pub(crate) struct SharedOptions {
     pub(crate) compact: Option<bool>,
     /// Disable parallel file processing.
     pub(crate) single_thread: Option<bool>,
+    /// Hide cost information in table and JSON output.
+    pub(crate) no_cost: Option<bool>,
+    /// Runtime pricing overrides keyed by raw model name.
+    pub(crate) pricing_overrides: Option<BTreeMap<String, ConfigPricingOverride>>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -449,6 +455,8 @@ pub(crate) struct StatuslineSpecificOptions {
     pub(crate) timezone: Option<String>,
     /// Show statusline debug information.
     pub(crate) debug: Option<bool>,
+    /// Map model identifiers to short display labels.
+    pub(crate) model_label_aliases: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -531,6 +539,21 @@ pub(crate) enum ConfigCostSource {
     Both,
 }
 
+#[derive(Debug, Default, Deserialize, JsonSchema, Clone)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConfigPricingOverride {
+    pub(crate) input_cost_per_token: Option<f64>,
+    pub(crate) output_cost_per_token: Option<f64>,
+    pub(crate) cache_creation_input_token_cost: Option<f64>,
+    pub(crate) cache_read_input_token_cost: Option<f64>,
+    pub(crate) input_cost_per_token_above_200k_tokens: Option<f64>,
+    pub(crate) output_cost_per_token_above_200k_tokens: Option<f64>,
+    pub(crate) cache_creation_input_token_cost_above_200k_tokens: Option<f64>,
+    pub(crate) cache_read_input_token_cost_above_200k_tokens: Option<f64>,
+    pub(crate) max_input_tokens: Option<u64>,
+    pub(crate) fast_multiplier: Option<f64>,
+}
+
 impl SharedOptions {
     pub(crate) fn from_map(map: &Map<String, Value>) -> Self {
         Self {
@@ -551,6 +574,8 @@ impl SharedOptions {
             all: bool_option(map, "all"),
             compact: bool_option(map, "compact"),
             single_thread: bool_option(map, "singleThread"),
+            no_cost: bool_option(map, "noCost"),
+            pricing_overrides: pricing_override_map_option(map, "pricingOverrides"),
         }
     }
 }
@@ -598,6 +623,7 @@ impl StatuslineSpecificOptions {
             context_medium_threshold: u64_option(map, "contextMediumThreshold"),
             timezone: string_option(map, "timezone"),
             debug: bool_option(map, "debug"),
+            model_label_aliases: hashmap_option(map, "modelLabelAliases"),
         }
     }
 }
@@ -654,7 +680,14 @@ pub(crate) fn generate_config_schema_json() -> String {
                     "$schema": "https://ccusage.com/config-schema.json",
                     "defaults": {
                         "json": false,
-                        "timezone": "Asia/Tokyo"
+                        "timezone": "Asia/Tokyo",
+                        "pricingOverrides": {
+                            "[pi] gpt-5.4": {
+                                "inputCostPerToken": 0.0000025,
+                                "outputCostPerToken": 0.000015,
+                                "cacheReadInputTokenCost": 0.00000025
+                            }
+                        }
                     },
                     "claude": {
                         "defaults": {
@@ -737,6 +770,28 @@ where
     serde_json::from_value(map.get(key)?.clone()).ok()
 }
 
+fn pricing_override_map_option(
+    map: &Map<String, Value>,
+    key: &str,
+) -> Option<BTreeMap<String, ConfigPricingOverride>> {
+    serde_json::from_value(map.get(key)?.clone()).ok()
+}
+
+fn hashmap_option(map: &Map<String, Value>, key: &str) -> Option<HashMap<String, String>> {
+    let obj = map.get(key)?.as_object()?;
+    let mut result = HashMap::new();
+    for (k, v) in obj {
+        if let Some(s) = v.as_str() {
+            result.insert(k.clone(), s.to_string());
+        }
+    }
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
+}
+
 fn enrich_schema(value: &mut Value) {
     match value {
         Value::Object(map) => {
@@ -779,6 +834,7 @@ fn add_schema_defaults(schema: &mut Value) {
             ("all", json!(false)),
             ("compact", json!(false)),
             ("singleThread", json!(false)),
+            ("noCost", json!(false)),
         ],
     );
     set_definition_defaults(schema, "WeeklyOptions", &[("startOfWeek", json!("sunday"))]);
@@ -931,8 +987,9 @@ fn wrap_root_schema(schema: &mut Value) {
 mod tests {
     use std::collections::BTreeSet;
 
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
+    use super::StatuslineSpecificOptions;
     use super::generate_config_schema_json;
 
     #[test]
@@ -949,9 +1006,11 @@ mod tests {
             "json",
             "mode",
             "noColor",
+            "noCost",
             "noOffline",
             "offline",
             "order",
+            "pricingOverrides",
             "since",
             "singleThread",
             "timezone",
@@ -986,6 +1045,7 @@ mod tests {
                 "contextMediumThreshold",
                 "costSource",
                 "debug",
+                "modelLabelAliases",
                 "noCache",
                 "noOffline",
                 "offline",
@@ -1290,6 +1350,39 @@ mod tests {
     }
 
     #[test]
+    fn statusline_options_parse_model_label_aliases() {
+        let map = serde_json::json!({
+            "modelLabelAliases": {
+                "arn:aws:bedrock:ap-northeast-1:012345678910:application-inference-profile/abcde12345": "claude-opus-4-6"
+            }
+        });
+        let options = StatuslineSpecificOptions::from_map(map.as_object().unwrap());
+
+        let aliases = options.model_label_aliases.unwrap();
+        assert_eq!(
+            aliases.get(
+                "arn:aws:bedrock:ap-northeast-1:012345678910:application-inference-profile/abcde12345"
+            ),
+            Some(&"claude-opus-4-6".to_string())
+        );
+    }
+
+    #[test]
+    fn statusline_options_ignore_non_string_alias_values() {
+        let map = serde_json::json!({
+            "modelLabelAliases": {
+                "valid": "short",
+                "invalid": 123
+            }
+        });
+        let options = StatuslineSpecificOptions::from_map(map.as_object().unwrap());
+
+        let aliases = options.model_label_aliases.unwrap();
+        assert_eq!(aliases.get("valid"), Some(&"short".to_string()));
+        assert!(!aliases.contains_key("invalid"));
+    }
+
+    #[test]
     fn snapshots_schema_agent_specific_option_edges() {
         if running_in_schema_generator_test_binary() {
             return;
@@ -1398,10 +1491,26 @@ mod tests {
         };
         let schema = resolve_schema(schema, root);
         let schema = merge_all_of(schema, root);
-        let properties = schema["properties"].as_object().unwrap();
+        let properties = schema.get("properties").and_then(Value::as_object);
         for (key, child_value) in value_object {
-            let Some(child_schema) = properties.get(key) else {
-                panic!("schema does not allow config key {key}");
+            let child_schema = if let Some(properties) = properties {
+                if let Some(child_schema) = properties.get(key) {
+                    child_schema
+                } else if schema
+                    .get("additionalProperties")
+                    .is_some_and(|v| !v.is_null() && *v != Value::Bool(false))
+                {
+                    schema.get("additionalProperties").unwrap()
+                } else {
+                    panic!("schema does not allow config key {key}");
+                }
+            } else if schema
+                .get("additionalProperties")
+                .is_some_and(|v| !v.is_null() && *v != Value::Bool(false))
+            {
+                schema.get("additionalProperties").unwrap()
+            } else {
+                panic!("schema node has no properties: {schema:?}");
             };
             assert_value_keys_allowed_by_schema(child_value, child_schema, root);
         }

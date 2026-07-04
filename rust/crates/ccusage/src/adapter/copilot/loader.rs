@@ -3,12 +3,13 @@ use std::{path::Path, sync::Arc};
 use jiff::tz::TimeZone as JiffTimeZone;
 
 use super::{
-    parser::{parse_otel_file, CopilotUsageEntry},
+    parser::{CopilotUsageEntry, parse_otel_file},
     paths::paths,
 };
 use crate::{
-    calculate_cost_for_usage, cli::CostMode, format_date_tz, parse_tz, LoadedEntry, Result,
-    TokenUsageRaw, UsageEntry, UsageMessage,
+    LoadedEntry, Result, TokenUsageRaw, UsageEntry, UsageMessage, calculate_cost_for_usage,
+    cli::CostMode, debug_log, format_date_tz, missing_pricing_model_for_usage, parse_tz,
+    read_files_parallel,
 };
 
 pub(crate) fn load_entries(
@@ -27,9 +28,24 @@ fn load_entries_inner(
     pricing: &crate::PricingMap,
 ) -> Result<Vec<LoadedEntry>> {
     let tz = parse_tz(shared.timezone.as_deref());
+    let files = paths()?;
+    // Read OTEL files in parallel; entries keep their original file order before
+    // the stable sort, so output is identical to the sequential read.
+    let loaded = read_files_parallel(&files, shared.single_thread, |path| {
+        read_otel_file(path, tz.as_ref(), shared.mode, pricing).unwrap_or_else(|error| {
+            debug_log(
+                shared,
+                format!(
+                    "Failed to read Copilot OTEL file {}: {error}",
+                    path.display()
+                ),
+            );
+            Vec::new()
+        })
+    });
     let mut entries = Vec::new();
-    for path in paths()? {
-        entries.extend(read_otel_file(&path, tz.as_ref(), shared.mode, pricing)?);
+    for file_entries in loaded {
+        entries.extend(file_entries);
     }
     entries.sort_by_key(|entry| entry.timestamp);
     Ok(entries)
@@ -59,9 +75,11 @@ fn usage_entry_to_loaded(
         cache_creation_input_tokens: entry.cache_creation_tokens,
         cache_read_input_tokens: entry.cache_read_tokens,
         speed: None,
+        cache_creation: None,
     };
     let cost_usage = TokenUsageRaw {
         output_tokens: entry.output_tokens + entry.reasoning_output_tokens,
+        cache_creation: None,
         ..usage
     };
     let data = UsageEntry {
@@ -76,8 +94,11 @@ fn usage_entry_to_loaded(
         cost_usd: None,
         request_id: None,
         is_api_error_message: None,
+        is_sidechain: None,
     };
     let cost = calculate_cost_for_usage(Some(&entry.model), cost_usage, None, mode, Some(pricing));
+    let missing_pricing_model =
+        missing_pricing_model_for_usage(Some(&entry.model), cost_usage, None, mode, Some(pricing));
     LoadedEntry {
         date: format_date_tz(entry.timestamp, tz),
         timestamp: entry.timestamp,
@@ -91,6 +112,7 @@ fn usage_entry_to_loaded(
         model: Some(entry.model),
         data,
         usage_limit_reset_time: None,
+        missing_pricing_model,
     }
 }
 
@@ -99,35 +121,17 @@ use super::report::{report_from_rows, summarize_entries};
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        env, fs,
-        path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
+    use ccusage_test_support::fs_fixture;
     use serde_json::json;
 
     use super::super::parser::parse_otel_file;
     use super::*;
     use crate::cli::AgentReportKind;
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = env::temp_dir().join(format!("ccusage-copilot-{name}-{nanos}"));
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[test]
     fn parses_copilot_chat_spans() {
-        let dir = temp_dir("chat-span");
-        let file = dir.join("copilot.jsonl");
-        fs::write(
-            &file,
-            [
+        let fixture = fs_fixture!({
+            "copilot.jsonl": [
                 json!({ "type": "metric", "name": "gen_ai.client.token.usage" }).to_string(),
                 json!({
                     "type": "span",
@@ -150,8 +154,8 @@ mod tests {
                 .to_string(),
             ]
             .join("\n"),
-        )
-        .unwrap();
+        });
+        let file = fixture.path("copilot.jsonl");
 
         let entries = parse_otel_file(&file).unwrap();
 
@@ -165,17 +169,12 @@ mod tests {
         assert_eq!(entries[0].cache_read_tokens, 123);
         assert_eq!(entries[0].reasoning_output_tokens, 128);
         assert_eq!(entries[0].dedup_key, "trace-1:span-1");
-
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn suppresses_lower_priority_records_for_same_response() {
-        let dir = temp_dir("dedup");
-        let file = dir.join("copilot.jsonl");
-        fs::write(
-            &file,
-            [
+        let fixture = fs_fixture!({
+            "copilot.jsonl": [
                 json!({
                     "type": "span",
                     "traceId": "trace-dupe",
@@ -220,8 +219,8 @@ mod tests {
                 .to_string(),
             ]
             .join("\n"),
-        )
-        .unwrap();
+        });
+        let file = fixture.path("copilot.jsonl");
 
         let entries = parse_otel_file(&file).unwrap();
 
@@ -229,16 +228,12 @@ mod tests {
         assert_eq!(entries[0].dedup_key, "trace-dupe:chat-1");
         assert_eq!(entries[0].input_tokens, 60);
         assert_eq!(entries[0].output_tokens, 10);
-
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn includes_reasoning_tokens_in_total_tokens() {
-        let dir = temp_dir("summary");
-        let file = dir.join("copilot.jsonl");
-        fs::write(
-            &file,
+        let fixture = fs_fixture!({
+            "copilot.jsonl":
             format!(
                 "{}\n",
                 json!({
@@ -259,8 +254,8 @@ mod tests {
                     },
                 })
             ),
-        )
-        .unwrap();
+        });
+        let file = fixture.path("copilot.jsonl");
         let mut pricing = crate::PricingMap::default();
         pricing.load_json(
             r#"{"test-model":{"input_cost_per_token":1,"output_cost_per_token":2,"cache_creation_input_token_cost":3,"cache_read_input_token_cost":4}}"#,
@@ -274,16 +269,12 @@ mod tests {
         assert_eq!(report["daily"][0]["outputTokens"], 50);
         assert_eq!(report["daily"][0]["totalTokens"], 175);
         assert_eq!(report["daily"][0]["totalCost"], 300.0);
-
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn falls_back_to_total_tokens_when_copilot_parts_are_missing() {
-        let dir = temp_dir("total");
-        let file = dir.join("copilot.jsonl");
-        fs::write(
-            &file,
+        let fixture = fs_fixture!({
+            "copilot.jsonl":
             format!(
                 "{}\n",
                 json!({
@@ -300,11 +291,10 @@ mod tests {
                     },
                 })
             ),
-        )
-        .unwrap();
+        });
+        let file = fixture.path("copilot.jsonl");
 
         let entries = parse_otel_file(&file).unwrap();
-        fs::remove_dir_all(dir).unwrap();
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].output_tokens, 567);

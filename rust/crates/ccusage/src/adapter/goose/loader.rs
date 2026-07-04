@@ -2,7 +2,9 @@ use std::{collections::HashSet, path::Path};
 
 use jiff::tz::TimeZone as JiffTimeZone;
 
-use crate::{cli::SharedArgs, debug_log, parse_tz, LoadedEntry, PricingMap, Result};
+use crate::{
+    LoadedEntry, PricingMap, Result, cli::SharedArgs, debug_log, parse_tz, read_files_parallel,
+};
 
 use super::{parser::row_to_entry, paths::goose_db_paths};
 
@@ -31,10 +33,26 @@ pub(crate) fn load_entries(shared: &SharedArgs, pricing: &PricingMap) -> Result<
 
 fn load_entries_inner(shared: &SharedArgs, pricing: &PricingMap) -> Result<Vec<LoadedEntry>> {
     let tz = parse_tz(shared.timezone.as_deref());
+    let db_paths = goose_db_paths()?;
+    // Load each database in parallel (a fresh read-only connection per DB), then
+    // run the sequential per-db dedup over the original path order so the
+    // surviving session per key matches the single-threaded read.
+    let loaded = read_files_parallel(&db_paths, shared.single_thread, |db_path| {
+        load_entries_from_db(db_path, tz.as_ref(), pricing, shared).unwrap_or_else(|error| {
+            debug_log(
+                shared,
+                format!(
+                    "Failed to load Goose database {}: {error}",
+                    db_path.display()
+                ),
+            );
+            Vec::new()
+        })
+    });
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
-    for db_path in goose_db_paths()? {
-        for entry in load_entries_from_db(&db_path, tz.as_ref(), pricing, shared)? {
+    for (db_path, db_entries) in db_paths.iter().zip(loaded) {
+        for entry in db_entries {
             let key = format!("{}:{}", db_path.display(), entry.session_id);
             if seen.insert(key) {
                 entries.push(entry);
@@ -91,21 +109,10 @@ fn load_entries_from_db(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        path::{Path, PathBuf},
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::path::Path;
 
     use super::*;
-
-    fn temp_dir(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("ccusage-goose-{name}-{nanos}"))
-    }
+    use ccusage_test_support::fs_fixture;
 
     fn create_goose_db(path: &Path) {
         let db = sqlite::open(path).unwrap();
@@ -167,9 +174,8 @@ INSERT INTO sessions (
 
     #[test]
     fn loads_accumulated_tokens_from_goose_sqlite() {
-        let dir = temp_dir("sqlite");
-        fs::create_dir_all(&dir).unwrap();
-        let db_path = dir.join(super::super::paths::GOOSE_DB_FILE_NAME);
+        let fixture = fs_fixture!({});
+        let db_path = fixture.path(super::super::paths::GOOSE_DB_FILE_NAME);
         create_goose_db(&db_path);
         insert_session(
             &db_path,
@@ -192,7 +198,6 @@ INSERT INTO sessions (
             &SharedArgs::default(),
         )
         .unwrap();
-        fs::remove_dir_all(&dir).unwrap();
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].date, "2026-05-01");

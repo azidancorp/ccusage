@@ -1,67 +1,122 @@
 use std::{fs, path::Path, sync::Arc};
 
 use jiff::tz::TimeZone as JiffTimeZone;
-use serde_json::Value;
+use serde::Deserialize;
 
+use super::super::jsonl;
 use crate::{
-    apply_total_token_fallback, format_date_tz, json_value_u64, non_empty_json_string, LoadedEntry,
-    Result, TokenUsageRaw, UsageEntry, UsageMessage,
+    LoadedEntry, PricingMap, Result, TokenUsageRaw, UsageEntry, UsageMessage,
+    apply_total_token_fallback, calculate_cost_for_usage, cli::CostMode, fast::LinePrefilter,
+    format_date_tz, missing_pricing_model_for_usage,
 };
+
+/// A single parsed pi session record. Only the fields ccusage consumes are
+/// declared; serde skips everything else.
+#[derive(Debug, Deserialize)]
+struct PiLine {
+    #[serde(default, deserialize_with = "jsonl::non_empty_string")]
+    r#type: Option<String>,
+    #[serde(default, deserialize_with = "jsonl::non_empty_string")]
+    timestamp: Option<String>,
+    message: Option<PiMessage>,
+}
+
+/// The pi `message` block carried by assistant records.
+#[derive(Debug, Deserialize)]
+struct PiMessage {
+    #[serde(default, deserialize_with = "jsonl::non_empty_string")]
+    role: Option<String>,
+    #[serde(default, deserialize_with = "jsonl::non_empty_string")]
+    model: Option<String>,
+    usage: Option<PiUsage>,
+}
+
+/// Token counts and optional display cost carried by a pi assistant message.
+#[derive(Debug, Default, Deserialize)]
+struct PiUsage {
+    #[serde(default, deserialize_with = "jsonl::lenient_u64")]
+    input: u64,
+    #[serde(default, deserialize_with = "jsonl::lenient_u64")]
+    output: u64,
+    #[serde(rename = "cacheRead", default, deserialize_with = "jsonl::lenient_u64")]
+    cache_read: u64,
+    #[serde(
+        rename = "cacheWrite",
+        default,
+        deserialize_with = "jsonl::lenient_u64"
+    )]
+    cache_write: u64,
+    #[serde(
+        rename = "totalTokens",
+        default,
+        deserialize_with = "jsonl::lenient_u64"
+    )]
+    total_tokens: u64,
+    // A non-object `cost` previously left display cost absent without dropping
+    // the record, so deserialize it leniently instead of failing the line.
+    #[serde(default, deserialize_with = "jsonl::lenient_object")]
+    cost: Option<PiCost>,
+}
+
+/// Optional display cost block carried by a pi assistant message.
+#[derive(Debug, Default, Deserialize)]
+struct PiCost {
+    #[serde(default, deserialize_with = "jsonl::lenient_f64")]
+    total: Option<f64>,
+}
 
 pub(crate) fn read_session_file(
     path: &Path,
     tz: Option<&JiffTimeZone>,
+    mode: CostMode,
+    pricing: Option<&PricingMap>,
 ) -> Result<Vec<LoadedEntry>> {
-    let content = fs::read_to_string(path)?;
+    let content = fs::read(path)?;
     let project = extract_project(path);
     let session_id = extract_session_id(path);
+    // Usable pi lines carry token counts under a `usage` key nested in a
+    // `message` object, so require both substrings before JSON parsing.
+    let prefilter = LinePrefilter::all(&[br#""usage""#, br#""message""#]);
     let mut entries = Vec::new();
 
-    for line in content.lines() {
-        if !line.contains("\"usage\"") || !line.contains("\"message\"") {
+    for record in jsonl::records::<PiLine>(&content, Some(&prefilter)) {
+        if !is_pi_message_usage(&record) {
             continue;
         }
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if !is_pi_message_usage(&value) {
-            continue;
-        }
-        let Some(timestamp_text) = non_empty_json_string(value.get("timestamp")) else {
+        let Some(timestamp_text) = record.timestamp.clone() else {
             continue;
         };
         let Some(timestamp) = crate::parse_ts_timestamp(&timestamp_text) else {
             continue;
         };
-        let Some(message) = value.get("message") else {
+        let Some(message) = record.message.as_ref() else {
             continue;
         };
-        let Some(usage_value) = message.get("usage") else {
+        let Some(usage_value) = message.usage.as_ref() else {
             continue;
         };
-        let input = json_value_u64(usage_value.get("input"));
-        let output = json_value_u64(usage_value.get("output"));
-        let cache_read = json_value_u64(usage_value.get("cacheRead"));
-        let cache_create = json_value_u64(usage_value.get("cacheWrite"));
-        let total = json_value_u64(usage_value.get("totalTokens"));
+        let input = usage_value.input;
+        let output = usage_value.output;
+        let cache_read = usage_value.cache_read;
+        let cache_create = usage_value.cache_write;
+        let total = usage_value.total_tokens;
         let usage = TokenUsageRaw {
             input_tokens: input,
             output_tokens: output,
             cache_creation_input_tokens: cache_create,
             cache_read_input_tokens: cache_read,
             speed: None,
+            cache_creation: None,
         };
         let (usage, extra_total_tokens) = apply_total_token_fallback(usage, 0, total);
         if crate::total_usage_tokens(usage) + extra_total_tokens == 0 {
             continue;
         }
-        let model =
-            non_empty_json_string(message.get("model")).map(|model| format!("[pi] {model}"));
-        let cost = usage_value
-            .get("cost")
-            .and_then(|cost| cost.get("total"))
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
+        let model = message.model.clone().map(|model| format!("[pi] {model}"));
+        let display_cost = usage_value.cost.as_ref().and_then(|cost| cost.total);
+        let cost = calculate_cost_for_usage(model.as_deref(), usage, display_cost, mode, pricing);
+        let missing_pricing_model =
+            missing_pricing_model_for_usage(model.as_deref(), usage, display_cost, mode, pricing);
         let data = UsageEntry {
             session_id: Some(session_id.clone()),
             timestamp: timestamp_text,
@@ -71,9 +126,10 @@ pub(crate) fn read_session_file(
                 model: model.clone(),
                 id: None,
             },
-            cost_usd: Some(cost),
+            cost_usd: display_cost,
             request_id: None,
             is_api_error_message: None,
+            is_sidechain: None,
         };
         entries.push(LoadedEntry {
             date: format_date_tz(timestamp, tz),
@@ -88,21 +144,24 @@ pub(crate) fn read_session_file(
             model,
             data,
             usage_limit_reset_time: None,
+            missing_pricing_model,
         });
     }
     Ok(entries)
 }
 
-fn is_pi_message_usage(value: &Value) -> bool {
-    let message_type = value.get("type").and_then(Value::as_str);
-    if message_type.is_some_and(|message_type| message_type != "message") {
+fn is_pi_message_usage(record: &PiLine) -> bool {
+    if record
+        .r#type
+        .as_deref()
+        .is_some_and(|message_type| message_type != "message")
+    {
         return false;
     }
-    let Some(message) = value.get("message") else {
+    let Some(message) = record.message.as_ref() else {
         return false;
     };
-    message.get("role").and_then(Value::as_str) == Some("assistant")
-        && message.get("usage").is_some()
+    message.role.as_deref() == Some("assistant") && message.usage.is_some()
 }
 
 fn extract_session_id(path: &Path) -> String {
@@ -152,30 +211,83 @@ pub(super) fn entry_id(entry: &LoadedEntry) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, fs, time::SystemTime};
-
     use super::*;
+    use ccusage_test_support::fs_fixture;
 
     #[test]
     fn falls_back_to_total_tokens_when_pi_parts_are_missing() {
-        let nanos = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = env::temp_dir().join(format!("ccusage-pi-total-{nanos}"));
-        fs::create_dir_all(dir.join("sessions/project-a")).unwrap();
-        let file = dir.join("sessions/project-a/agent_session-a.jsonl");
-        fs::write(
-            &file,
-            r#"{"type":"message","timestamp":"2026-01-02T00:00:00.000Z","message":{"role":"assistant","model":"gpt-5","usage":{"totalTokens":333}}}"#,
-        )
-        .unwrap();
+        let fixture = fs_fixture!({
+            "sessions/project-a/agent_session-a.jsonl": r#"{"type":"message","timestamp":"2026-01-02T00:00:00.000Z","message":{"role":"assistant","model":"gpt-5","usage":{"totalTokens":333}}}"#,
+        });
+        let file = fixture.path("sessions/project-a/agent_session-a.jsonl");
 
-        let entries = read_session_file(&file, None).unwrap();
-        fs::remove_dir_all(&dir).unwrap();
+        let entries = read_session_file(&file, None, CostMode::Display, None).unwrap();
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].data.message.usage.output_tokens, 333);
         assert_eq!(entries[0].extra_total_tokens, 0);
+    }
+
+    #[test]
+    fn sets_missing_pricing_model_when_model_not_in_pricing() {
+        let fixture = fs_fixture!({
+            "sessions/project-a/agent_session-a.jsonl": r#"{"type":"message","timestamp":"2026-01-02T00:00:00.000Z","message":{"role":"assistant","model":"unknown-model-xyz","usage":{"input":100,"output":200}}}"#,
+        });
+        let file = fixture.path("sessions/project-a/agent_session-a.jsonl");
+
+        // Use Calculate mode with an empty PricingMap so model won't be found
+        let pricing = PricingMap::default();
+        let entries = read_session_file(&file, None, CostMode::Calculate, Some(&pricing)).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].missing_pricing_model.as_deref(),
+            Some("[pi] unknown-model-xyz")
+        );
+    }
+
+    #[test]
+    fn no_missing_pricing_model_in_display_mode() {
+        let fixture = fs_fixture!({
+            "sessions/project-a/agent_session-a.jsonl": r#"{"type":"message","timestamp":"2026-01-02T00:00:00.000Z","message":{"role":"assistant","model":"unknown-model-xyz","usage":{"input":100,"output":200}}}"#,
+        });
+        let file = fixture.path("sessions/project-a/agent_session-a.jsonl");
+
+        let pricing = PricingMap::default();
+        let entries = read_session_file(&file, None, CostMode::Display, Some(&pricing)).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].missing_pricing_model, None);
+    }
+
+    #[test]
+    fn no_missing_pricing_model_when_auto_mode_has_display_cost() {
+        let fixture = fs_fixture!({
+            "sessions/project-a/agent_session-a.jsonl": r#"{"type":"message","timestamp":"2026-01-02T00:00:00.000Z","message":{"role":"assistant","model":"unknown-model-xyz","usage":{"input":100,"output":200,"cost":{"total":0.05}}}}"#,
+        });
+        let file = fixture.path("sessions/project-a/agent_session-a.jsonl");
+
+        let pricing = PricingMap::default();
+        let entries = read_session_file(&file, None, CostMode::Auto, Some(&pricing)).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        // In Auto mode with a display cost present, no missing pricing warning
+        assert_eq!(entries[0].missing_pricing_model, None);
+    }
+
+    #[test]
+    fn keeps_record_when_cost_is_not_an_object() {
+        // A non-object `cost` must not fail the whole line; the usage tokens
+        // should still be counted with display cost treated as missing.
+        let fixture = fs_fixture!({
+            "sessions/project-a/agent_session-a.jsonl": r#"{"type":"message","timestamp":"2026-01-02T00:00:00.000Z","message":{"role":"assistant","model":"gpt-5","usage":{"input":100,"output":200,"cost":0}}}"#,
+        });
+        let file = fixture.path("sessions/project-a/agent_session-a.jsonl");
+
+        let entries = read_session_file(&file, None, CostMode::Display, None).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].data.message.usage.input_tokens, 100);
+        assert_eq!(entries[0].data.message.usage.output_tokens, 200);
     }
 }

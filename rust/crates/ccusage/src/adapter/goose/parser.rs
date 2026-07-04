@@ -1,12 +1,21 @@
 use std::sync::Arc;
 
 use jiff::tz::TimeZone as JiffTimeZone;
-use serde_json::Value;
+use serde::Deserialize;
 
+use super::super::jsonl;
 use crate::{
-    calculate_cost_for_usage, cli::CostMode, format_date_tz, LoadedEntry, PricingMap,
-    TokenUsageRaw, UsageEntry, UsageMessage,
+    LoadedEntry, PricingMap, TokenUsageRaw, UsageEntry, UsageMessage, calculate_cost_for_usage,
+    cli::CostMode, format_date_tz, missing_pricing_model_for_candidates,
 };
+
+/// Goose stores the per-session model selection as a JSON blob in the
+/// `model_config_json` column. Only the human-readable model name is consumed.
+#[derive(Debug, Deserialize)]
+struct GooseModelConfig {
+    #[serde(default, deserialize_with = "jsonl::non_empty_string")]
+    model_name: Option<String>,
+}
 
 pub(super) fn row_to_entry(
     statement: &sqlite::Statement<'_>,
@@ -41,6 +50,7 @@ pub(super) fn row_to_entry(
         cache_creation_input_tokens: 0,
         cache_read_input_tokens: 0,
         speed: None,
+        cache_creation: None,
     };
     let timestamp_text = crate::format_rfc3339_millis(timestamp);
     let data = UsageEntry {
@@ -55,8 +65,11 @@ pub(super) fn row_to_entry(
         cost_usd: None,
         request_id: None,
         is_api_error_message: None,
+        is_sidechain: None,
     };
     let cost = calculate_goose_cost(&model, &provider_id, usage, reasoning_tokens, pricing);
+    let missing_pricing_model =
+        missing_goose_pricing(&model, &provider_id, usage, reasoning_tokens, pricing);
 
     Some(LoadedEntry {
         date: format_date_tz(timestamp, tz),
@@ -68,6 +81,7 @@ pub(super) fn row_to_entry(
         credits: None,
         model: Some(model),
         usage_limit_reset_time: None,
+        missing_pricing_model,
         extra_total_tokens: reasoning_tokens,
         message_count: None,
         data,
@@ -92,9 +106,8 @@ fn read_timestamp_value(statement: &sqlite::Statement<'_>, index: usize) -> Opti
 }
 
 fn parse_goose_model_config(value: &str) -> Option<String> {
-    let value = serde_json::from_str::<Value>(value).ok()?;
-    let model = value.get("model_name")?.as_str()?.trim();
-    (!model.is_empty()).then(|| model.to_string())
+    let config = serde_json::from_str::<GooseModelConfig>(value).ok()?;
+    config.model_name
 }
 
 fn parse_goose_timestamp(value: &str) -> Option<crate::TimestampMs> {
@@ -161,6 +174,7 @@ fn calculate_goose_cost(
 ) -> f64 {
     let cost_usage = TokenUsageRaw {
         output_tokens: usage.output_tokens.saturating_add(reasoning_tokens),
+        cache_creation: None,
         ..usage
     };
     let raw = calculate_cost_for_usage(
@@ -179,6 +193,30 @@ fn calculate_goose_cost(
         cost_usage,
         None,
         CostMode::Calculate,
+        Some(pricing),
+    )
+}
+
+fn missing_goose_pricing(
+    model: &str,
+    provider_id: &str,
+    usage: TokenUsageRaw,
+    reasoning_tokens: u64,
+    pricing: &PricingMap,
+) -> Option<String> {
+    let cost_usage = TokenUsageRaw {
+        output_tokens: usage.output_tokens.saturating_add(reasoning_tokens),
+        cache_creation: None,
+        ..usage
+    };
+    let mut candidates = vec![model.to_string()];
+    if provider_id != "goose" {
+        candidates.push(format!("{provider_id}/{model}"));
+    }
+    missing_pricing_model_for_candidates(
+        model,
+        candidates,
+        crate::total_usage_tokens(cost_usage),
         Some(pricing),
     )
 }

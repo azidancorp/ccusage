@@ -29,7 +29,7 @@ npx ccusage@latest
 ```
 
 ```bash [pkg.pr.new preview]
-bunx -p https://pkg.pr.new/ryoppippi/ccusage@<pr-number> ccusage --offline
+bunx -p https://pkg.pr.new/ccusage/ccusage@<pr-number> ccusage --offline
 ```
 
 :::
@@ -86,31 +86,34 @@ For development or contributing to ccusage:
 
 ```bash
 # Clone the repository
-git clone https://github.com/ryoppippi/ccusage.git
+git clone https://github.com/ccusage/ccusage.git
 cd ccusage
 
-# Install dependencies
-pnpm install
-
-# Run directly from source
-pnpm --filter ccusage start daily
-pnpm --filter ccusage start monthly --json
+# Allow direnv to load the Nix dev shell
+direnv allow
 ```
 
-### Development Scripts
+The Nix dev shell provides the pinned `pnpm`, Rust toolchain, GitHub CLI, git hooks, package tooling, and project utilities. Run project tasks with `just`:
 
 ```bash
-# Run tests
-pnpm run test
+# Format the tree
+just fmt
 
-# Type checking
-pnpm typecheck
+# Run tests
+just test
+
+# Run static checks
+just check
 
 # Build distribution
-pnpm --filter ccusage build
+just build
+```
 
-# Lint and format
-pnpm run format
+You can also run the package directly from source:
+
+```bash
+pnpm --filter ccusage start daily
+pnpm --filter ccusage start monthly --json
 ```
 
 ## Runtime Requirements

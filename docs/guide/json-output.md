@@ -20,6 +20,15 @@ ccusage session --json
 ccusage blocks --json
 ```
 
+Use `--no-cost` with `--json` when reports should omit cost data:
+
+```bash
+ccusage daily --json --no-cost
+ccusage blocks --json --no-cost
+```
+
+This removes cost fields such as `totalCost`, `costUSD`, and nested `cost` values while keeping token, model, date, block, burn-rate, and projection fields.
+
 ## JSON Structure
 
 ### Daily Reports (Standard)
@@ -157,7 +166,8 @@ ccusage daily --project my-frontend-app --json
 			"cacheReadTokens": 1024,
 			"totalTokens": 356894,
 			"costUSD": 156.4,
-			"lastActivity": "2026-05-15"
+			"firstActivity": "2026-05-15T09:30:00.000Z",
+			"lastActivity": "2026-05-15T17:45:30.000Z"
 		}
 	],
 	"summary": {
@@ -230,7 +240,8 @@ ccusage daily --project my-frontend-app --json
 #### Session Reports
 
 - `session`: Session identifier
-- `lastActivity`: Date of last activity in the session
+- `firstActivity`: RFC 3339 timestamp of first activity in the session
+- `lastActivity`: RFC 3339 timestamp of last activity in the session
 
 #### Blocks Reports
 
@@ -259,6 +270,9 @@ ccusage daily --json --order asc
 
 # With model breakdown
 ccusage daily --json --breakdown
+
+# Hide cost fields
+ccusage daily --json --no-cost
 
 # Project analysis
 ccusage daily --json --instances                    # Group by project

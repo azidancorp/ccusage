@@ -3,8 +3,9 @@ use std::{collections::HashSet, fs, io, path::Path};
 use serde_json::Value;
 
 use crate::{
-    apply_total_token_fallback, calculate_cost_for_usage, cli::CostMode, format_rfc3339_millis,
-    json_value_u64, parse_ts_timestamp, PricingMap, Result, TokenUsageRaw,
+    PricingMap, Result, TokenUsageRaw, apply_total_token_fallback, calculate_cost_for_usage,
+    cli::CostMode, format_rfc3339_millis, json_value_u64, missing_pricing_model_for_candidates,
+    parse_ts_timestamp,
 };
 
 #[derive(Clone)]
@@ -83,6 +84,7 @@ pub(super) fn load_settings_file(path: &Path) -> Result<Option<DroidEntry>> {
             cache_creation_input_tokens: usage.cache_creation_tokens,
             cache_read_input_tokens: usage.cache_read_tokens,
             speed: None,
+            cache_creation: None,
         },
         reasoning_tokens: usage.thinking_tokens,
     }))
@@ -96,6 +98,7 @@ pub(super) fn parse_token_usage(value: Option<&Value>) -> Option<DroidTokenUsage
         cache_creation_input_tokens: json_value_u64(usage.get("cacheCreationTokens")),
         cache_read_input_tokens: json_value_u64(usage.get("cacheReadTokens")),
         speed: None,
+        cache_creation: None,
     };
     let thinking_tokens = json_value_u64(usage.get("thinkingTokens"));
     let total_tokens = json_value_u64(usage.get("totalTokens"));
@@ -121,10 +124,10 @@ fn settings_timestamp(
     settings: &serde_json::Map<String, Value>,
     path: &Path,
 ) -> Option<(crate::TimestampMs, String)> {
-    if let Some(timestamp_text) = string_field(settings, "providerLockTimestamp") {
-        if let Some(timestamp) = parse_ts_timestamp(&timestamp_text) {
-            return Some((timestamp, format_rfc3339_millis(timestamp)));
-        }
+    if let Some(timestamp_text) = string_field(settings, "providerLockTimestamp")
+        && let Some(timestamp) = parse_ts_timestamp(&timestamp_text)
+    {
+        return Some((timestamp, format_rfc3339_millis(timestamp)));
     }
     let modified = fs::metadata(path).ok()?.modified().ok()?;
     let millis = modified
@@ -139,6 +142,7 @@ fn settings_timestamp(
 pub(super) fn calculate_droid_cost(entry: &DroidEntry, pricing: &PricingMap) -> f64 {
     let usage = TokenUsageRaw {
         output_tokens: entry.usage.output_tokens + entry.reasoning_tokens,
+        cache_creation: None,
         ..entry.usage
     };
     for candidate in droid_model_candidates(entry) {
@@ -154,6 +158,20 @@ pub(super) fn calculate_droid_cost(entry: &DroidEntry, pricing: &PricingMap) -> 
         }
     }
     0.0
+}
+
+pub(super) fn missing_droid_pricing(entry: &DroidEntry, pricing: &PricingMap) -> Option<String> {
+    let usage = TokenUsageRaw {
+        output_tokens: entry.usage.output_tokens + entry.reasoning_tokens,
+        cache_creation: None,
+        ..entry.usage
+    };
+    missing_pricing_model_for_candidates(
+        &entry.model,
+        droid_model_candidates(entry),
+        crate::total_usage_tokens(usage),
+        Some(pricing),
+    )
 }
 
 fn droid_model_candidates(entry: &DroidEntry) -> Vec<String> {

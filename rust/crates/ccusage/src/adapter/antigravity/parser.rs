@@ -3,11 +3,11 @@ use std::{collections::BTreeSet, sync::Arc};
 use jiff::tz::TimeZone as JiffTimeZone;
 
 use crate::{
-    cli::CostMode, format_date_tz, format_rfc3339_millis, LoadedEntry, TimestampMs, TokenUsageRaw,
-    UsageEntry, UsageMessage,
+    LoadedEntry, TimestampMs, TokenUsageRaw, UsageEntry, UsageMessage, cli::CostMode,
+    format_date_tz, format_rfc3339_millis,
 };
 
-use super::proto::{parse_fields, ProtoFields};
+use super::proto::{ProtoFields, parse_fields};
 
 const USER_STEP_TYPE: i64 = 14;
 const PLANNER_STEP_TYPE: i64 = 15;
@@ -179,6 +179,7 @@ pub(super) fn usage_event_to_loaded(
         cache_creation_input_tokens: 0,
         cache_read_input_tokens: event.cache_read_tokens,
         speed: None,
+        cache_creation: None,
     };
     let data = UsageEntry {
         session_id: Some(event.session_id.clone()),
@@ -195,6 +196,7 @@ pub(super) fn usage_event_to_loaded(
         cost_usd: None,
         request_id: None,
         is_api_error_message: None,
+        is_sidechain: None,
     };
     let cost = match mode {
         CostMode::Display => 0.0,
@@ -212,6 +214,7 @@ pub(super) fn usage_event_to_loaded(
         message_count: Some(1),
         model: Some(DEFAULT_MODEL.to_string()),
         usage_limit_reset_time: None,
+        missing_pricing_model: None,
         data,
     }
 }

@@ -3,11 +3,15 @@
 ## Environment
 
 This repo requires the Nix flake development environment with nix-direnv for
-contributor setup. Use the activated direnv shell so the pinned Rust, Bun, pnpm,
+contributor setup. Use the activated direnv shell so the pinned Rust, pnpm,
 git hooks, agent skills, and repository CLIs are all on `PATH`.
 
 Use the activated `direnv` environment for normal work. For non-interactive
 one-offs from outside the shell, prefer `direnv exec . <command>`.
+
+Repo-wide tasks run through `just` (see `just --list`); each recipe routes to
+the tool that owns the work — the pnpm workspace for package fan-out and the Nix
+flake for hermetic jobs like formatting and checks.
 
 Tools are managed by `flake.nix` and `package.json`. Use `comma` or `nix run`
 for one-off investigation when appropriate, but add recurring project tools to
@@ -23,14 +27,14 @@ the repo instead:
 After code changes, run formatting first when formatting may apply because it mutates files:
 
 ```sh
-pnpm run format
+just fmt
 ```
 
 Git hooks and CI cover the standard validation path. Run typecheck and tests manually when the change touches behavior, types, package code, or when hooks/CI do not cover the edited files:
 
 ```sh
-pnpm typecheck
-pnpm run test
+just typecheck
+just test
 ```
 
 For package-local work, run the narrower package scripts during iteration when

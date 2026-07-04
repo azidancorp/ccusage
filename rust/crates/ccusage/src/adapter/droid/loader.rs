@@ -3,12 +3,12 @@ use std::{collections::HashSet, sync::Arc};
 use jiff::tz::TimeZone as JiffTimeZone;
 
 use super::{
-    parser::{calculate_droid_cost, load_settings_file, DroidEntry},
+    parser::{DroidEntry, calculate_droid_cost, load_settings_file, missing_droid_pricing},
     paths::discover_settings_files,
 };
 use crate::{
-    cli::SharedArgs, format_date_tz, parse_tz, LoadedEntry, PricingMap, Result, UsageEntry,
-    UsageMessage,
+    LoadedEntry, PricingMap, Result, UsageEntry, UsageMessage, cli::SharedArgs, debug_log,
+    format_date_tz, parse_tz, read_files_parallel,
 };
 
 pub(crate) fn load_entries(shared: &SharedArgs, pricing: &PricingMap) -> Result<Vec<LoadedEntry>> {
@@ -21,12 +21,22 @@ fn load_entries_inner(shared: &SharedArgs, pricing: &PricingMap) -> Result<Vec<L
     let tz = parse_tz(shared.timezone.as_deref());
     let mut files = discover_settings_files()?;
     files.sort();
-    let mut parsed = Vec::new();
-    for file in files {
-        if let Some(entry) = load_settings_file(&file)? {
-            parsed.push(entry);
-        }
-    }
+    // Read files in parallel, reassembled in the original (sorted) file order so
+    // the subsequent stable sort and reverse latest-wins dedup pick the same
+    // snapshot per session as the single-threaded read.
+    let loaded = read_files_parallel(&files, shared.single_thread, |file| {
+        load_settings_file(file).unwrap_or_else(|error| {
+            debug_log(
+                shared,
+                format!(
+                    "Failed to read Droid settings file {}: {error}",
+                    file.display()
+                ),
+            );
+            None
+        })
+    });
+    let mut parsed: Vec<DroidEntry> = loaded.into_iter().flatten().collect();
     parsed.sort_by_key(|entry| entry.timestamp);
     let mut seen_sessions = HashSet::new();
     let mut entries = Vec::new();
@@ -45,6 +55,7 @@ fn to_loaded_entry(
     pricing: &PricingMap,
 ) -> LoadedEntry {
     let cost = calculate_droid_cost(&entry, pricing);
+    let missing_pricing_model = missing_droid_pricing(&entry, pricing);
     let data = UsageEntry {
         session_id: Some(entry.session_id.clone()),
         timestamp: entry.timestamp_text.clone(),
@@ -57,6 +68,7 @@ fn to_loaded_entry(
         cost_usd: None,
         request_id: None,
         is_api_error_message: None,
+        is_sidechain: None,
     };
     LoadedEntry {
         date: format_date_tz(entry.timestamp, tz),
@@ -69,6 +81,7 @@ fn to_loaded_entry(
         extra_total_tokens: entry.reasoning_tokens,
         model: Some(entry.model),
         usage_limit_reset_time: None,
+        missing_pricing_model,
         message_count: None,
         data,
     }
@@ -79,13 +92,7 @@ use super::report::{report_from_rows, summarize_entries};
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        env, fs,
-        path::PathBuf,
-        sync::Mutex,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
+    use ccusage_test_support::{EnvVarGuard, fs_fixture};
     use serde_json::json;
 
     use super::super::{
@@ -94,38 +101,8 @@ mod tests {
     };
     use super::*;
     use crate::{
-        cli::AgentReportKind, parse_ts_timestamp, TokenUsageRaw, UsageEntry, UsageMessage,
+        TokenUsageRaw, UsageEntry, UsageMessage, cli::AgentReportKind, parse_ts_timestamp,
     };
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvDirGuard {
-        key: &'static str,
-        dir: PathBuf,
-    }
-
-    impl EnvDirGuard {
-        fn set(key: &'static str, dir: PathBuf) -> Self {
-            env::set_var(key, &dir);
-            Self { key, dir }
-        }
-    }
-
-    impl Drop for EnvDirGuard {
-        fn drop(&mut self) {
-            env::remove_var(self.key);
-            let _ = fs::remove_dir_all(&self.dir);
-        }
-    }
-
-    fn temp_dir(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        env::temp_dir().join(format!("ccusage-droid-{name}-{nanos}"))
-    }
-
     #[test]
     fn normalizes_droid_model_names() {
         assert_eq!(
@@ -155,12 +132,8 @@ mod tests {
 
     #[test]
     fn loads_usage_from_droid_settings_files() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let dir = temp_dir("settings");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(
-            dir.join("session-a.settings.json"),
-            r#"{
+        let fixture = fs_fixture!({
+            "session-a.settings.json": r#"{
                 "model": "Claude-Sonnet-4-[Anthropic]",
                 "providerLock": "anthropic",
                 "providerLockTimestamp": "2026-05-01T01:02:03.000Z",
@@ -172,14 +145,9 @@ mod tests {
                     "thinkingTokens": 5
                 }
             }"#,
-        )
-        .unwrap();
-        fs::write(
-            dir.join("zero.settings.json"),
-            r#"{"model":"gpt-5","tokenUsage":{"inputTokens":0}}"#,
-        )
-        .unwrap();
-        let _cleanup = EnvDirGuard::set(DROID_SESSIONS_DIR_ENV, dir.clone());
+            "zero.settings.json": r#"{"model":"gpt-5","tokenUsage":{"inputTokens":0}}"#,
+        });
+        let _cleanup = EnvVarGuard::set(DROID_SESSIONS_DIR_ENV, fixture.root());
 
         let pricing = PricingMap::load_embedded();
         let shared = SharedArgs {
@@ -204,24 +172,15 @@ mod tests {
 
     #[test]
     fn falls_back_to_sidecar_jsonl_model() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let dir = temp_dir("sidecar");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(
-            dir.join("session-b.settings.json"),
-            r#"{
+        let fixture = fs_fixture!({
+            "session-b.settings.json": r#"{
                 "providerLock": "anthropic",
                 "providerLockTimestamp": "2026-05-02T01:02:03.000Z",
                 "tokenUsage": {"inputTokens": 10, "outputTokens": 20}
             }"#,
-        )
-        .unwrap();
-        fs::write(
-            dir.join("session-b.jsonl"),
-            r#"{"content":"Model: Claude Opus 4.5 Thinking [Anthropic]"}"#,
-        )
-        .unwrap();
-        let _cleanup = EnvDirGuard::set(DROID_SESSIONS_DIR_ENV, dir);
+            "session-b.jsonl": r#"{"content":"Model: Claude Opus 4.5 Thinking [Anthropic]"}"#,
+        });
+        let _cleanup = EnvVarGuard::set(DROID_SESSIONS_DIR_ENV, fixture.root());
 
         let pricing = PricingMap::load_embedded();
         let entries = load_entries(&SharedArgs::default(), &pricing).unwrap();
@@ -235,31 +194,21 @@ mod tests {
 
     #[test]
     fn keeps_latest_snapshot_for_duplicate_session_ids() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let dir = temp_dir("dedupe-latest");
-        let archive_dir = dir.join("archive");
-        fs::create_dir_all(&archive_dir).unwrap();
-        fs::write(
-            archive_dir.join("session-c.settings.json"),
-            r#"{
+        let fixture = fs_fixture!({
+            "archive/session-c.settings.json": r#"{
                 "model": "gpt-5",
                 "providerLock": "openai",
                 "providerLockTimestamp": "2026-05-01T01:02:03.000Z",
                 "tokenUsage": {"inputTokens": 10, "outputTokens": 20}
             }"#,
-        )
-        .unwrap();
-        fs::write(
-            dir.join("session-c.settings.json"),
-            r#"{
+            "session-c.settings.json": r#"{
                 "model": "gpt-5",
                 "providerLock": "openai",
                 "providerLockTimestamp": "2026-05-02T01:02:03.000Z",
                 "tokenUsage": {"inputTokens": 100, "outputTokens": 200}
             }"#,
-        )
-        .unwrap();
-        let _cleanup = EnvDirGuard::set(DROID_SESSIONS_DIR_ENV, dir);
+        });
+        let _cleanup = EnvVarGuard::set(DROID_SESSIONS_DIR_ENV, fixture.root());
 
         let pricing = PricingMap::load_embedded();
         let entries = load_entries(&SharedArgs::default(), &pricing).unwrap();
@@ -284,6 +233,7 @@ mod tests {
                         cache_creation_input_tokens: 20,
                         cache_read_input_tokens: 10,
                         speed: None,
+                        cache_creation: None,
                     },
                     model: Some("claude-sonnet-4".to_string()),
                     id: Some("droid:session-a".to_string()),
@@ -291,6 +241,7 @@ mod tests {
                 cost_usd: None,
                 request_id: None,
                 is_api_error_message: None,
+                is_sidechain: None,
             },
             timestamp: parse_ts_timestamp("2026-05-01T01:02:03.000Z").unwrap(),
             date: "2026-05-01".to_string(),
@@ -302,6 +253,7 @@ mod tests {
             extra_total_tokens: 5,
             model: Some("claude-sonnet-4".to_string()),
             usage_limit_reset_time: None,
+            missing_pricing_model: None,
             message_count: None,
         };
         let rows = summarize_entries(&[entry], AgentReportKind::Daily).unwrap();

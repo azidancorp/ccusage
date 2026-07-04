@@ -1,9 +1,9 @@
 use std::{collections::HashSet, path::Path};
 
-use crate::{cli::SharedArgs, LoadedEntry, PricingMap, Result};
+use crate::{LoadedEntry, PricingMap, Result, cli::SharedArgs, read_files_parallel};
 
 use super::{
-    parser::{read_session_row, to_loaded_entry, HermesEntry},
+    parser::{HermesEntry, read_session_row, to_loaded_entry},
     paths::hermes_state_db_paths,
 };
 
@@ -15,10 +15,17 @@ pub(crate) fn load_entries(shared: &SharedArgs, pricing: &PricingMap) -> Result<
 
 fn load_entries_inner(shared: &SharedArgs, pricing: &PricingMap) -> Result<Vec<LoadedEntry>> {
     let tz = crate::parse_tz(shared.timezone.as_deref());
+    let db_paths = hermes_state_db_paths()?;
+    // Load each state database in parallel (a fresh read-only connection per DB),
+    // then run the sequential session dedup over the original path order so the
+    // surviving session matches the single-threaded read.
+    let loaded = read_files_parallel(&db_paths, shared.single_thread, |db_path| {
+        load_state_db_entries(db_path, shared)
+    });
     let mut entries = Vec::new();
     let mut seen_sessions = HashSet::new();
-    for db_path in hermes_state_db_paths()? {
-        for entry in load_state_db_entries(&db_path, shared) {
+    for db_entries in loaded {
+        for entry in db_entries {
             if !seen_sessions.insert(entry.session_id.clone()) {
                 continue;
             }
@@ -97,21 +104,10 @@ fn load_state_db_entries(db_path: &Path, shared: &SharedArgs) -> Vec<HermesEntry
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        path::{Path, PathBuf},
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::path::Path;
 
     use super::*;
-
-    fn temp_dir(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("ccusage-hermes-{name}-{nanos}"))
-    }
+    use ccusage_test_support::fs_fixture;
 
     fn create_state_db(path: &Path) {
         let db = sqlite::open(path).unwrap();
@@ -139,9 +135,8 @@ mod tests {
 
     #[test]
     fn loads_billable_hermes_sessions_from_state_db() {
-        let dir = temp_dir("state");
-        fs::create_dir_all(&dir).unwrap();
-        let db_path = dir.join("state.db");
+        let fixture = fs_fixture!({});
+        let db_path = fixture.path("state.db");
         create_state_db(&db_path);
         let db = sqlite::open(&db_path).unwrap();
         let mut statement = db
@@ -180,7 +175,6 @@ mod tests {
             .into_iter()
             .map(|entry| to_loaded_entry(entry, tz.as_ref(), &pricing))
             .collect::<Vec<_>>();
-        fs::remove_dir_all(&dir).unwrap();
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].date, "2025-06-15");

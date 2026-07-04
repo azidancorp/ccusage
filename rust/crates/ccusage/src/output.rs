@@ -1,18 +1,27 @@
 use std::{
-    collections::BTreeMap,
-    io::{BufWriter, Write},
+    collections::{BTreeMap, BTreeSet},
+    io::{self, BufWriter, IsTerminal, Write},
 };
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::{
+    Align, Color, Result, SimpleTable, USAGE_COMPACT_WIDTH_THRESHOLD, UsageSummary,
     cli::SharedArgs, cli_error, color, format_project_name, parse_project_aliases, print_box_title,
-    short_model_name, terminal_width, Align, Color, Result, SimpleTable, UsageSummary,
-    USAGE_COMPACT_WIDTH_THRESHOLD,
+    short_model_name, terminal_width,
 };
 
 pub(crate) fn wants_json(shared: &SharedArgs) -> bool {
     shared.json || shared.jq.is_some()
+}
+
+pub(crate) fn should_use_compact_layout(
+    shared: &SharedArgs,
+    is_stdout_tty: bool,
+    terminal_width: usize,
+    compact_width_threshold: usize,
+) -> bool {
+    shared.compact || (is_stdout_tty && terminal_width < compact_width_threshold)
 }
 
 pub(crate) fn summary_json(row: &UsageSummary) -> Value {
@@ -56,6 +65,7 @@ pub(crate) fn session_summary_json(row: &UsageSummary) -> Value {
         "totalTokens": row.total_tokens(),
         "totalCost": row.total_cost,
         "lastActivity": row.last_activity,
+        "firstActivity": row.first_activity,
         "modelsUsed": row.models_used,
         "modelBreakdowns": row.model_breakdowns,
         "projectPath": row.project_path,
@@ -101,7 +111,10 @@ pub(crate) fn group_project_output(rows: &[UsageSummary]) -> Value {
     json!(projects)
 }
 
-pub(crate) fn print_json_or_jq(value: Value, jq: Option<&str>) -> Result<()> {
+pub(crate) fn print_json_or_jq(mut value: Value, jq: Option<&str>, no_cost: bool) -> Result<()> {
+    if no_cost {
+        strip_cost_json(&mut value);
+    }
     if let Some(filter) = jq {
         let mut child = std::process::Command::new("jq")
             .arg(filter)
@@ -142,7 +155,13 @@ pub(crate) fn print_usage_table(
         return Ok(());
     }
     let terminal_width = terminal_width();
-    let compact = shared.compact || terminal_width < USAGE_COMPACT_WIDTH_THRESHOLD;
+    let is_tty = io::stdout().is_terminal();
+    let compact = should_use_compact_layout(
+        shared,
+        is_tty,
+        terminal_width,
+        USAGE_COMPACT_WIDTH_THRESHOLD,
+    );
     let include_last_activity = rows.iter().any(|row| row.last_activity.is_some());
     print_box_title(title, shared);
     let mut headers = if compact {
@@ -179,30 +198,33 @@ pub(crate) fn print_usage_table(
             Align::Right,
         ]
     };
+    if shared.no_cost {
+        headers.pop();
+        aligns.pop();
+    }
     if include_last_activity {
         headers.push("Last Activity");
         aligns.push(Align::Left);
     }
-    let mut table = SimpleTable::new(headers, aligns, shared)
+    let mut table = SimpleTable::new(headers, aligns, crate::terminal_style(shared))
         .with_terminal_width(terminal_width)
         .with_date_compaction(true);
     let aliases = parse_project_aliases(project_aliases);
     let mut current_project: Option<&str> = None;
     for row in rows {
-        if group_projects {
-            if let Some(project) = row.project.as_deref() {
-                if current_project != Some(project) {
-                    if current_project.is_some() {
-                        table.separator();
-                    }
-                    table.push(project_header_row(
-                        table.column_count(),
-                        &format_project_name(project, &aliases),
-                        shared,
-                    ));
-                    current_project = Some(project);
-                }
+        if group_projects
+            && let Some(project) = row.project.as_deref()
+            && current_project != Some(project)
+        {
+            if current_project.is_some() {
+                table.separator();
             }
+            table.push(project_header_row(
+                table.column_count(),
+                &format_project_name(project, &aliases),
+                shared,
+            ));
+            current_project = Some(project);
         }
         let label = row
             .date
@@ -233,8 +255,13 @@ pub(crate) fn print_usage_table(
                 format_currency(row.total_cost),
             ]
         };
+        if shared.no_cost {
+            values.pop();
+        }
         if include_last_activity {
-            values.push(row.last_activity.clone().unwrap_or_default());
+            values.push(truncate_rfc3339_to_date(
+                row.last_activity.as_deref().unwrap_or_default(),
+            ));
         }
         table.push(values);
         if shared.breakdown {
@@ -288,11 +315,15 @@ pub(crate) fn print_usage_table(
             color(shared, format_currency(total_cost), Color::Yellow),
         ]
     };
+    if shared.no_cost {
+        total_row.pop();
+    }
     if include_last_activity {
         total_row.push(String::new());
     }
     table.push(total_row);
     table.print()?;
+    print_missing_pricing_warnings(rows, shared.offline);
     if compact {
         eprintln!("\nRunning in Compact Mode");
         eprintln!("Expand terminal width to see cache metrics and total tokens");
@@ -302,6 +333,53 @@ pub(crate) fn print_usage_table(
 
 fn empty_usage_table_message() -> &'static str {
     "No usage data found."
+}
+
+pub(crate) fn print_missing_pricing_warnings(rows: &[UsageSummary], offline: bool) {
+    for warning in missing_pricing_warnings(rows, offline) {
+        eprintln!("{warning}");
+    }
+}
+
+pub(crate) fn missing_pricing_warnings(rows: &[UsageSummary], offline: bool) -> Vec<String> {
+    let models = rows
+        .iter()
+        .flat_map(|row| &row.model_breakdowns)
+        .filter(|breakdown| breakdown.missing_pricing)
+        .map(|breakdown| breakdown.model_name.as_str());
+
+    missing_pricing_warnings_for_models(models, offline)
+}
+
+pub(crate) fn print_missing_pricing_warnings_for_models<'a>(
+    models: impl IntoIterator<Item = &'a str>,
+    offline: bool,
+) {
+    for warning in missing_pricing_warnings_for_models(models, offline) {
+        eprintln!("{warning}");
+    }
+}
+
+pub(crate) fn missing_pricing_warnings_for_models<'a>(
+    models: impl IntoIterator<Item = &'a str>,
+    offline: bool,
+) -> Vec<String> {
+    let models = models.into_iter().collect::<BTreeSet<_>>();
+
+    models
+        .into_iter()
+        .map(|model| {
+            if offline {
+                format!(
+                    "WARN  Missing embedded pricing for {model}; cost excludes this model. Run without --offline or update ccusage after pricing is added."
+                )
+            } else {
+                format!(
+                    "WARN  Missing pricing for {model}; cost excludes this model. Update pricing or run again after LiteLLM has the model."
+                )
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn json_float(value: f64) -> Value {
@@ -372,6 +450,9 @@ fn push_breakdown_rows(
                 color(shared, format_currency(breakdown.cost), Color::Grey),
             ]
         };
+        if shared.no_cost {
+            values.pop();
+        }
         if include_last_activity {
             values.push(String::new());
         }
@@ -409,10 +490,57 @@ pub(crate) fn format_currency(value: f64) -> String {
     format!("${value:.2}")
 }
 
+pub(crate) fn strip_cost_json(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.remove("totalCost");
+            map.remove("costUSD");
+            map.remove("cost");
+            for (_, child) in map.iter_mut() {
+                strip_cost_json(child);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                strip_cost_json(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn truncate_rfc3339_to_date(s: &str) -> String {
+    s.get(..10).unwrap_or(s).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ModelBreakdown;
+
+    #[test]
+    fn narrow_non_tty_output_does_not_auto_compact() {
+        let shared = SharedArgs::default();
+
+        assert!(!should_use_compact_layout(&shared, false, 80, 100));
+    }
+
+    #[test]
+    fn narrow_tty_output_auto_compacts() {
+        let shared = SharedArgs::default();
+
+        assert!(should_use_compact_layout(&shared, true, 80, 100));
+    }
+
+    #[test]
+    fn compact_flag_forces_compact_for_non_tty_output() {
+        let shared = SharedArgs {
+            compact: true,
+            ..SharedArgs::default()
+        };
+
+        assert!(should_use_compact_layout(&shared, false, 120, 100));
+    }
 
     #[test]
     fn empty_usage_table_message_is_provider_agnostic() {
@@ -428,6 +556,7 @@ mod tests {
             session_id: None,
             project_path: None,
             last_activity: None,
+            first_activity: None,
             input_tokens: 100,
             output_tokens: 50,
             cache_creation_tokens: 10,
@@ -446,10 +575,110 @@ mod tests {
     }
 
     #[test]
+    fn strip_cost_json_removes_cost_fields_recursively() {
+        let mut value = json!({
+            "daily": [
+                {
+                    "date": "2026-01-02",
+                    "totalTokens": 172,
+                    "totalCost": 0.25,
+                    "modelBreakdowns": [
+                        {
+                            "modelName": "gpt-5",
+                            "costUSD": 0.1,
+                            "inputTokens": 100
+                        }
+                    ],
+                }
+            ],
+            "blocks": [
+                {
+                    "id": "2026-01-02T00:00:00.000Z",
+                    "costUSD": 1.5,
+                    "burnRate": {
+                        "tokensPerMinute": 10,
+                        "cost": 0.25
+                    },
+                    "projection": {
+                        "totalTokens": 300,
+                        "totalCost": 2.0
+                    }
+                }
+            ],
+            "totals": {
+                "totalTokens": 172,
+                "totalCost": 0.25
+            }
+        });
+
+        strip_cost_json(&mut value);
+
+        assert_eq!(
+            value,
+            json!({
+                "daily": [
+                    {
+                        "date": "2026-01-02",
+                        "totalTokens": 172,
+                        "modelBreakdowns": [
+                            {
+                                "modelName": "gpt-5",
+                                "inputTokens": 100
+                            }
+                        ],
+                    }
+                ],
+                "blocks": [
+                    {
+                        "id": "2026-01-02T00:00:00.000Z",
+                        "burnRate": {
+                            "tokensPerMinute": 10
+                        },
+                        "projection": {
+                            "totalTokens": 300
+                        }
+                    }
+                ],
+                "totals": {
+                    "totalTokens": 172
+                }
+            })
+        );
+    }
+
+    #[test]
     fn snapshots_summary_json_with_optional_fields_and_model_breakdowns() {
         let row = snapshot_summary("2026-01-02", Some("workspace/api"), Some(1.25));
 
         insta::assert_json_snapshot!(summary_json(&row));
+    }
+
+    #[test]
+    fn missing_pricing_warnings_deduplicate_models() {
+        let mut row = snapshot_summary("2026-01-02", None, None);
+        row.model_breakdowns[0].missing_pricing = true;
+        row.model_breakdowns[1].missing_pricing = true;
+
+        assert_eq!(
+            missing_pricing_warnings(&[row], false),
+            vec![
+                "WARN  Missing pricing for claude-sonnet-4-20250514; cost excludes this model. Update pricing or run again after LiteLLM has the model.",
+                "WARN  Missing pricing for gpt-5.2-codex; cost excludes this model. Update pricing or run again after LiteLLM has the model.",
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_pricing_warnings_mention_embedded_pricing_offline() {
+        let mut row = snapshot_summary("2026-01-02", None, None);
+        row.model_breakdowns[0].missing_pricing = true;
+
+        assert_eq!(
+            missing_pricing_warnings(&[row], true),
+            vec![
+                "WARN  Missing embedded pricing for gpt-5.2-codex; cost excludes this model. Run without --offline or update ccusage after pricing is added.",
+            ]
+        );
     }
 
     #[test]
@@ -458,7 +687,8 @@ mod tests {
         row.date = None;
         row.session_id = Some("session-a".to_string());
         row.project_path = Some("/Users/example/workspace/api".to_string());
-        row.last_activity = Some("2026-01-02 12:34:56".to_string());
+        row.last_activity = Some("2026-01-02T12:34:56.000Z".to_string());
+        row.first_activity = Some("2026-01-01T10:30:00.000Z".to_string());
 
         insta::assert_json_snapshot!(session_summary_json(&row));
     }
@@ -507,6 +737,7 @@ mod tests {
             session_id: None,
             project_path: None,
             last_activity: None,
+            first_activity: None,
             input_tokens: 1_234,
             output_tokens: 567,
             cache_creation_tokens: 89,
@@ -528,6 +759,7 @@ mod tests {
                     cache_read_tokens: 10,
                     extra_total_tokens: 0,
                     cost: 0.3,
+                    missing_pricing: false,
                 },
                 ModelBreakdown {
                     model_name: "claude-sonnet-4-20250514".to_string(),
@@ -537,6 +769,7 @@ mod tests {
                     cache_read_tokens: 0,
                     extra_total_tokens: 0,
                     cost: 0.12,
+                    missing_pricing: false,
                 },
             ],
             project: project.map(str::to_string),

@@ -1,7 +1,7 @@
 [package]
 name = "ccusage"
-version = "20.0.4"
-edition = "2021"
+version = "20.0.14"
+edition = "2024"
 build = "build.rs"
 
 [[bin]]
@@ -13,15 +13,16 @@ name = "generate-config-schema"
 path = "src/bin/generate_config_schema.rs"
 
 [dependencies]
+ccusage-cli = { path = "../ccusage-cli" }
 ccusage-terminal = { path = "../ccusage-terminal" }
 jiff = { version = "0.2.24", default-features = false, features = [
 	"std",
 	"tz-system",
 	"tzdb-zoneinfo",
+	"tzdb-bundle-platform",
 ] }
 memchr = "2"
 compact_str = "0.9"
-phf = { version = "0.13", features = ["macros"] }
 rustc-hash = "2"
 schemars = "0.8"
 serde = { version = "1", features = ["derive"] }

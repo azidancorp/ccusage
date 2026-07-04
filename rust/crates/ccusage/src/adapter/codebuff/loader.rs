@@ -3,12 +3,12 @@ use std::{collections::HashMap, sync::Arc};
 use jiff::tz::TimeZone as JiffTimeZone;
 
 use super::{
-    parser::{calculate_codebuff_cost, load_chat_file, CodebuffEntry},
+    parser::{CodebuffEntry, calculate_codebuff_cost, load_chat_file, missing_codebuff_pricing},
     paths::discover_chat_files,
 };
 use crate::{
-    cli::SharedArgs, format_date_tz, parse_tz, LoadedEntry, PricingMap, Result, UsageEntry,
-    UsageMessage,
+    LoadedEntry, PricingMap, Result, UsageEntry, UsageMessage, cli::SharedArgs, debug_log,
+    format_date_tz, parse_tz, read_files_parallel,
 };
 
 pub(crate) fn load_entries(shared: &SharedArgs, pricing: &PricingMap) -> Result<Vec<LoadedEntry>> {
@@ -23,9 +23,24 @@ fn load_entries_inner(shared: &SharedArgs, pricing: &PricingMap) -> Result<Vec<L
     let tz = parse_tz(shared.timezone.as_deref());
     let mut files = discover_chat_files()?;
     files.sort();
+    // Read files in parallel but apply the last-wins dedup sequentially over the
+    // original (sorted) file order, so the surviving entry per dedup key is
+    // identical to the single-threaded read.
+    let loaded = read_files_parallel(&files, shared.single_thread, |file| {
+        load_chat_file(file).unwrap_or_else(|error| {
+            debug_log(
+                shared,
+                format!(
+                    "Failed to read Codebuff chat file {}: {error}",
+                    file.display()
+                ),
+            );
+            Vec::new()
+        })
+    });
     let mut deduped = HashMap::<String, CodebuffEntry>::new();
-    for file in files {
-        for entry in load_chat_file(&file)? {
+    for file_entries in loaded {
+        for entry in file_entries {
             deduped.insert(entry.dedup_key.clone(), entry);
         }
     }
@@ -43,6 +58,7 @@ fn to_loaded_entry(
     pricing: &PricingMap,
 ) -> LoadedEntry {
     let cost = calculate_codebuff_cost(&entry, pricing);
+    let missing_pricing_model = missing_codebuff_pricing(&entry, pricing);
     let data = UsageEntry {
         session_id: Some(entry.session_id.clone()),
         timestamp: entry.timestamp_text.clone(),
@@ -55,6 +71,7 @@ fn to_loaded_entry(
         cost_usd: None,
         request_id: None,
         is_api_error_message: None,
+        is_sidechain: None,
     };
     LoadedEntry {
         date: format_date_tz(entry.timestamp, tz),
@@ -67,6 +84,7 @@ fn to_loaded_entry(
         credits: (entry.credits > 0.0).then_some(entry.credits),
         model: Some(entry.model),
         usage_limit_reset_time: None,
+        missing_pricing_model,
         message_count: None,
         data,
     }
@@ -77,63 +95,22 @@ use super::report::{report_from_rows, summarize_entries};
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        env, fs,
-        path::PathBuf,
-        sync::Mutex,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
     use super::super::{parser::parse_usage_object, paths::CODEBUFF_DATA_DIR_ENV};
     use super::*;
     use crate::{
-        cli::AgentReportKind, parse_ts_timestamp, TokenUsageRaw, UsageEntry, UsageMessage,
+        TokenUsageRaw, UsageEntry, UsageMessage, cli::AgentReportKind, parse_ts_timestamp,
     };
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvDirGuard {
-        key: &'static str,
-        dir: PathBuf,
-    }
-
-    impl EnvDirGuard {
-        fn set(key: &'static str, dir: PathBuf) -> Self {
-            env::set_var(key, &dir);
-            Self { key, dir }
-        }
-    }
-
-    impl Drop for EnvDirGuard {
-        fn drop(&mut self) {
-            env::remove_var(self.key);
-            let _ = fs::remove_dir_all(&self.dir);
-        }
-    }
-
-    fn temp_dir(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        env::temp_dir().join(format!("ccusage-codebuff-{name}-{nanos}"))
-    }
+    use ccusage_test_support::{EnvVarGuard, fs_fixture};
 
     #[test]
     fn loads_assistant_usage_from_chat_messages() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let dir = temp_dir("chat");
-        let chat_dir = dir.join("projects/project-a/chats/2026-01-02T03-04-05.000Z");
-        fs::create_dir_all(&chat_dir).unwrap();
-        fs::write(
-            chat_dir.join("chat-messages.json"),
-            r#"[
+        let fixture = fs_fixture!({
+            "projects/project-a/chats/2026-01-02T03-04-05.000Z/chat-messages.json": r#"[
                 {"role":"user","text":"hello"},
                 {"id":"assistant-message","role":"assistant","timestamp":"2026-01-02T03:04:06.000Z","metadata":{"model":"claude-sonnet-4-20250514","usage":{"inputTokens":100,"outputTokens":50,"cacheCreationInputTokens":20,"cacheReadInputTokens":10}},"credits":1.25}
             ]"#,
-        )
-        .unwrap();
-        let _cleanup = EnvDirGuard::set(CODEBUFF_DATA_DIR_ENV, dir.clone());
+        });
+        let _cleanup = EnvVarGuard::set(CODEBUFF_DATA_DIR_ENV, fixture.root());
 
         let pricing = PricingMap::load_embedded();
         let shared = SharedArgs {
@@ -142,7 +119,7 @@ mod tests {
         };
         let entries = load_entries(&shared, &pricing).unwrap();
 
-        let channel = dir.file_name().unwrap().to_str().unwrap();
+        let channel = fixture.root().file_name().unwrap().to_str().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].date, "2026-01-02");
         assert_eq!(
@@ -161,21 +138,15 @@ mod tests {
 
     #[test]
     fn falls_back_to_run_state_provider_usage() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let dir = temp_dir("run-state");
-        let chat_dir = dir.join("projects/project-a/chats/2026-01-02T03-04-05.000Z");
-        fs::create_dir_all(&chat_dir).unwrap();
-        fs::write(
-            chat_dir.join("chat-messages.json"),
-            r#"[
+        let fixture = fs_fixture!({
+            "projects/project-a/chats/2026-01-02T03-04-05.000Z/chat-messages.json": r#"[
                 {"variant":"agent","metadata":{"runState":{"sessionState":{"mainAgentState":{"messageHistory":[
                     {"role":"user","providerOptions":{}},
                     {"role":"assistant","providerOptions":{"codebuff":{"model":"openai/gpt-5","usage":{"prompt_tokens":100,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":10}}}}}
                 ]}}}}}
             ]"#,
-        )
-        .unwrap();
-        let _cleanup = EnvDirGuard::set(CODEBUFF_DATA_DIR_ENV, dir);
+        });
+        let _cleanup = EnvVarGuard::set(CODEBUFF_DATA_DIR_ENV, fixture.root());
 
         let pricing = PricingMap::load_embedded();
         let entries = load_entries(&SharedArgs::default(), &pricing).unwrap();
@@ -214,6 +185,7 @@ mod tests {
                         cache_creation_input_tokens: 20,
                         cache_read_input_tokens: 10,
                         speed: None,
+                        cache_creation: None,
                     },
                     model: Some("claude-sonnet-4-20250514".to_string()),
                     id: Some("message-a".to_string()),
@@ -221,6 +193,7 @@ mod tests {
                 cost_usd: None,
                 request_id: None,
                 is_api_error_message: None,
+                is_sidechain: None,
             },
             timestamp: parse_ts_timestamp("2026-01-02T03:04:06.000Z").unwrap(),
             date: "2026-01-02".to_string(),
@@ -232,6 +205,7 @@ mod tests {
             credits: Some(1.25),
             model: Some("claude-sonnet-4-20250514".to_string()),
             usage_limit_reset_time: None,
+            missing_pricing_model: None,
             message_count: None,
         };
         let rows = summarize_entries(&[entry], AgentReportKind::Daily).unwrap();

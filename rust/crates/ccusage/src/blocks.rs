@@ -1,15 +1,17 @@
-use serde_json::{json, Value};
+use std::io::IsTerminal;
+
+use serde_json::{Value, json};
 
 use crate::{
-    am_pm,
+    Align, BLOCKS_COMPACT_WIDTH_THRESHOLD, BLOCKS_WARNING_THRESHOLD, BurnRate, Color, LoadedEntry,
+    MILLIS_PER_HOUR, MILLIS_PER_MINUTE, Projection, Result, SessionBlock, SimpleTable, TimestampMs,
+    TokenCounts, am_pm,
     cli::{SharedArgs, SortOrder},
     color,
     fast::FxHashSet,
     format_currency, format_date, format_models_multiline, format_number, format_rfc3339_millis,
-    format_utc_second, hour_12, json_float, local_parts, print_box_title, terminal_width, utc_now,
-    Align, BurnRate, Color, LoadedEntry, Projection, Result, SessionBlock, SimpleTable,
-    TimestampMs, TokenCounts, BLOCKS_COMPACT_WIDTH_THRESHOLD, BLOCKS_WARNING_THRESHOLD,
-    MILLIS_PER_HOUR, MILLIS_PER_MINUTE,
+    format_utc_second, hour_12, json_float, local_parts, print_box_title,
+    should_use_compact_layout, terminal_width, utc_now,
 };
 
 pub(crate) fn identify_session_blocks(
@@ -56,10 +58,10 @@ pub(crate) fn identify_session_blocks(
         current_entries.push(entry);
     }
 
-    if let Some(start) = current_start {
-        if !current_entries.is_empty() {
-            blocks.push(create_block(start, current_entries, now, session_duration));
-        }
+    if let Some(start) = current_start
+        && !current_entries.is_empty()
+    {
+        blocks.push(create_block(start, current_entries, now, session_duration));
     }
     blocks
 }
@@ -86,8 +88,9 @@ fn create_block(
         token_counts.add_usage(entry.data.message.usage);
         cost += entry.cost;
         if let Some(model) = &entry.model {
+            let model = crate::model_aliases::resolve_model_name(model).into_owned();
             if seen_models.insert(model.clone()) {
-                models.push(model.clone());
+                models.push(model);
             }
         }
         usage_limit_reset_time = usage_limit_reset_time.or(entry.usage_limit_reset_time);
@@ -225,7 +228,9 @@ fn format_block_time(block: &SessionBlock, compact: bool) -> String {
         let remaining_hours = remaining / 60;
         let remaining_minutes = remaining.rem_euclid(60);
         return if compact {
-            format!("{start}\n({elapsed_hours}h{elapsed_minutes}m/{remaining_hours}h{remaining_minutes}m)")
+            format!(
+                "{start}\n({elapsed_hours}h{elapsed_minutes}m/{remaining_hours}h{remaining_minutes}m)"
+            )
         } else {
             format!(
                 "{start} ({elapsed_hours}h {elapsed_minutes}m elapsed, {remaining_hours}h {remaining_minutes}m remaining)"
@@ -302,7 +307,13 @@ pub(crate) fn print_blocks_table(
         return Ok(());
     }
     let terminal_width = terminal_width();
-    let compact = shared.compact || terminal_width < BLOCKS_COMPACT_WIDTH_THRESHOLD;
+    let is_tty = std::io::stdout().is_terminal();
+    let compact = should_use_compact_layout(
+        shared,
+        is_tty,
+        terminal_width,
+        BLOCKS_COMPACT_WIDTH_THRESHOLD,
+    );
     let actual_limit = parse_token_limit(token_limit, max_tokens);
     print_box_title("Claude Code Token Usage Report - Session Blocks", shared);
     let mut headers = vec!["Block Start", "Duration/Status", "Models", "Tokens"];
@@ -313,7 +324,12 @@ pub(crate) fn print_blocks_table(
     }
     headers.push("Cost");
     aligns.push(Align::Right);
-    let mut table = SimpleTable::new(headers, aligns, shared).with_terminal_width(terminal_width);
+    if shared.no_cost {
+        headers.pop();
+        aligns.pop();
+    }
+    let mut table = SimpleTable::new(headers, aligns, crate::terminal_style(shared))
+        .with_terminal_width(terminal_width);
     for block in blocks {
         if block.is_gap {
             let mut row = vec![
@@ -325,7 +341,9 @@ pub(crate) fn print_blocks_table(
             if actual_limit.is_some_and(|limit| limit > 0) {
                 row.push(color(shared, "-", Color::Grey));
             }
-            row.push(color(shared, "-", Color::Grey));
+            if !shared.no_cost {
+                row.push(color(shared, "-", Color::Grey));
+            }
             table.push(row);
             continue;
         }
@@ -349,7 +367,9 @@ pub(crate) fn print_blocks_table(
                 percent_text
             });
         }
-        row.push(format_currency(block.cost_usd));
+        if !shared.no_cost {
+            row.push(format_currency(block.cost_usd));
+        }
         table.push(row);
 
         if block.is_active {
@@ -376,7 +396,9 @@ pub(crate) fn print_blocks_table(
                 } else {
                     color(shared, "0.0%", Color::Red)
                 });
-                remaining_row.push(String::new());
+                if !shared.no_cost {
+                    remaining_row.push(String::new());
+                }
                 table.push(remaining_row);
             }
 
@@ -397,7 +419,9 @@ pub(crate) fn print_blocks_table(
                     let percentage = projection.total_tokens as f64 / limit as f64 * 100.0;
                     projected_row.push(format!("{percentage:.1}%"));
                 }
-                projected_row.push(format_currency(projection.total_cost));
+                if !shared.no_cost {
+                    projected_row.push(format_currency(projection.total_cost));
+                }
                 table.push(projected_row);
             }
         }
@@ -440,7 +464,9 @@ pub(crate) fn print_active_block_detail(
         "  Output Tokens:    {}",
         format_number(block.token_counts.output_tokens)
     );
-    println!("  Total Cost:       {}", format_currency(block.cost_usd));
+    if !shared.no_cost {
+        println!("  Total Cost:       {}", format_currency(block.cost_usd));
+    }
 
     if let Some(rate) = calculate_burn_rate(block) {
         println!();
@@ -449,10 +475,12 @@ pub(crate) fn print_active_block_detail(
             "  Tokens/minute:    {}",
             format_number(rate.tokens_per_minute.round() as u64)
         );
-        println!(
-            "  Cost/hour:        {}",
-            format_currency(rate.cost_per_hour)
-        );
+        if !shared.no_cost {
+            println!(
+                "  Cost/hour:        {}",
+                format_currency(rate.cost_per_hour)
+            );
+        }
     }
 
     if let Some(projection) = project_block_usage(block) {
@@ -469,10 +497,12 @@ pub(crate) fn print_active_block_detail(
             "  Total Tokens:     {}",
             format_number(projection.total_tokens)
         );
-        println!(
-            "  Total Cost:       {}",
-            format_currency(projection.total_cost)
-        );
+        if !shared.no_cost {
+            println!(
+                "  Total Cost:       {}",
+                format_currency(projection.total_cost)
+            );
+        }
 
         if let Some(limit) = parse_token_limit(token_limit, max_tokens) {
             let current = block.token_counts.total();

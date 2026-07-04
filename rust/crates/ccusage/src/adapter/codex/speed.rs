@@ -1,53 +1,72 @@
+use std::fs;
+
 use crate::cli::CodexSpeed;
 
-const CODEX_FAST_COST_MULTIPLIER_START_MILLIS: i64 = 1_775_520_000_000; // 2026-04-07T00:00:00.000Z
-const CODEX_FAST_COST_MULTIPLIER_END_MILLIS: i64 = 1_778_284_800_000; // 2026-05-09T00:00:00.000Z
-const CODEX_FAST_COST_MULTIPLIER_RESTART_MILLIS: i64 = 1_778_787_180_000; // 2026-05-14T19:33:00.000Z
+use super::paths;
 
-pub(crate) fn resolve_codex_speed_for_timestamp(
-    requested: CodexSpeed,
-    timestamp: crate::TimestampMs,
-) -> CodexSpeed {
+pub(crate) fn resolve_codex_speed(requested: CodexSpeed) -> CodexSpeed {
     match requested {
-        CodexSpeed::Auto if is_codex_fast_window(timestamp) => CodexSpeed::Fast,
-        CodexSpeed::Auto => CodexSpeed::Standard,
+        CodexSpeed::Auto => {
+            if detect_codex_fast_service_tier() {
+                CodexSpeed::Fast
+            } else {
+                CodexSpeed::Standard
+            }
+        }
         speed => speed,
     }
 }
 
-fn is_codex_fast_window(timestamp: crate::TimestampMs) -> bool {
-    let millis = timestamp.as_millis();
-    (CODEX_FAST_COST_MULTIPLIER_START_MILLIS..CODEX_FAST_COST_MULTIPLIER_END_MILLIS)
-        .contains(&millis)
-        || millis >= CODEX_FAST_COST_MULTIPLIER_RESTART_MILLIS
+fn detect_codex_fast_service_tier() -> bool {
+    codex_home_paths().iter().any(|path| {
+        fs::read_to_string(path.join("config.toml"))
+            .ok()
+            .is_some_and(|content| codex_config_requests_fast_service_tier(&content))
+    })
+}
+
+fn codex_home_paths() -> Vec<std::path::PathBuf> {
+    paths::codex_home_paths().unwrap_or_default()
+}
+
+fn codex_config_requests_fast_service_tier(content: &str) -> bool {
+    content.lines().any(|line| {
+        let setting = line.split('#').next().unwrap_or_default().trim();
+        let Some((key, value)) = setting.split_once('=') else {
+            return false;
+        };
+        if key.trim() != "service_tier" {
+            return false;
+        }
+        let value = value.trim().trim_matches(['"', '\'']);
+        matches!(value, "fast" | "priority")
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_codex_speed_for_timestamp;
-    use crate::cli::CodexSpeed;
+    use super::codex_config_requests_fast_service_tier;
 
     #[test]
-    fn resolves_auto_speed_by_personal_timestamp_windows() {
-        let before_gap = crate::parse_ts_timestamp("2026-05-08T23:59:59.999Z").unwrap();
-        let gap_start = crate::parse_ts_timestamp("2026-05-09T00:00:00.000Z").unwrap();
-        let restart = crate::parse_ts_timestamp("2026-05-14T19:33:00.000Z").unwrap();
+    fn detects_explicit_fast_service_tier_values() {
+        assert!(codex_config_requests_fast_service_tier(
+            r#"service_tier = "fast""#,
+        ));
+        assert!(codex_config_requests_fast_service_tier(
+            r#"service_tier = 'priority' # use higher tier"#,
+        ));
+    }
 
-        assert_eq!(
-            resolve_codex_speed_for_timestamp(CodexSpeed::Auto, before_gap),
-            CodexSpeed::Fast
-        );
-        assert_eq!(
-            resolve_codex_speed_for_timestamp(CodexSpeed::Auto, gap_start),
-            CodexSpeed::Standard
-        );
-        assert_eq!(
-            resolve_codex_speed_for_timestamp(CodexSpeed::Auto, restart),
-            CodexSpeed::Fast
-        );
-        assert_eq!(
-            resolve_codex_speed_for_timestamp(CodexSpeed::Standard, restart),
-            CodexSpeed::Standard
-        );
+    #[test]
+    fn ignores_unrelated_or_substring_service_tier_values() {
+        assert!(!codex_config_requests_fast_service_tier(
+            r#"service_tier_override = "fast""#,
+        ));
+        assert!(!codex_config_requests_fast_service_tier(
+            r#"service_tier = "breakfast""#,
+        ));
+        assert!(!codex_config_requests_fast_service_tier(
+            r#"service_tier = "standard""#,
+        ));
     }
 }

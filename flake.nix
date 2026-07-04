@@ -17,6 +17,10 @@
       url = "github:BerriAI/litellm";
       flake = false;
     };
+    models-dev = {
+      url = "github:anomalyco/models.dev";
+      flake = false;
+    };
     nix-filter.url = "github:numtide/nix-filter";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
@@ -46,6 +50,8 @@
         ./nix/git-hooks.nix
         ./nix/packages.nix
         ./nix/static-package.nix
+        ./nix/darwin-x64-package.nix
+        ./nix/tests.nix
         ./nix/checks.nix
         ./nix/dev-shell.nix
       ];

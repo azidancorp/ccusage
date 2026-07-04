@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{collect_files_with_extension, Result};
+use crate::{Result, collect_files_with_extension};
 
 pub(super) const ANTIGRAVITY_DATA_DIR_ENV: &str = "ANTIGRAVITY_DATA_DIR";
 const ANTIGRAVITY_ROOT: &str = "antigravity-cli";
@@ -56,27 +56,10 @@ fn conversation_dir(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::fs;
 
     use super::*;
-
-    struct EnvDirGuard {
-        dir: PathBuf,
-    }
-
-    impl EnvDirGuard {
-        fn set(dir: PathBuf) -> Self {
-            env::set_var(ANTIGRAVITY_DATA_DIR_ENV, &dir);
-            Self { dir }
-        }
-    }
-
-    impl Drop for EnvDirGuard {
-        fn drop(&mut self) {
-            env::remove_var(ANTIGRAVITY_DATA_DIR_ENV);
-            let _ = fs::remove_dir_all(&self.dir);
-        }
-    }
+    use ccusage_test_support::EnvVarGuard;
 
     fn temp_antigravity_dir(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -88,13 +71,12 @@ mod tests {
 
     #[test]
     fn discovers_conversation_databases_under_antigravity_root() {
-        let _guard = super::super::ANTIGRAVITY_DATA_DIR_LOCK.lock().unwrap();
         let dir = temp_antigravity_dir("discover");
         fs::create_dir_all(dir.join("conversations/nested")).unwrap();
         fs::write(dir.join("conversations/session-a.db"), b"").unwrap();
         fs::write(dir.join("conversations/nested/session-b.db"), b"").unwrap();
         fs::write(dir.join("conversations/session-a.db-wal"), b"").unwrap();
-        let _cleanup = EnvDirGuard::set(dir.clone());
+        let _cleanup = EnvVarGuard::set(ANTIGRAVITY_DATA_DIR_ENV, &dir);
 
         let files = discover_conversation_dbs().unwrap();
 

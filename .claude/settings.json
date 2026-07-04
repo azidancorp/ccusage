@@ -5,10 +5,7 @@
 			"Bash(pnpm typecheck*)",
 			"Bash(pnpm run typecheck*)",
 			"Bash(pnpm test*)",
-			"Bash(pnpm run test*)",
-			"Bash(vitest*)",
-			"Bash(bun test*)",
-			"Bash(bun run test*)"
+			"Bash(pnpm run test*)"
 		]
 	},
 	"hooks": {
@@ -18,6 +15,16 @@
 					{
 						"type": "command",
 						"command": "command -v direnv >/dev/null 2>&1 && direnv allow"
+					}
+				]
+			}
+		],
+		"WorktreeRemove": [
+			{
+				"hooks": [
+					{
+						"type": "command",
+						"command": "rm -rf .direnv; command -v nix >/dev/null 2>&1 && nix store gc || true"
 					}
 				]
 			}

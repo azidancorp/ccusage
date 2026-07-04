@@ -4,7 +4,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use crate::{collect_files_with_extension, Result};
+use crate::{Result, collect_files_with_extension};
 
 pub(super) const KIMI_DATA_DIR_ENV: &str = "KIMI_DATA_DIR";
 pub(super) const KIMI_MODEL_NAME_ENV: &str = "KIMI_MODEL_NAME";
@@ -164,72 +164,27 @@ pub(super) fn combine_stream_id(parent_stream_id: &str, child_stream_id: &str) -
 
 #[cfg(test)]
 mod tests {
-    use std::{env, fs, path::PathBuf};
-
     use super::*;
-
-    fn temp_kimi_dir(name: &str) -> PathBuf {
-        let mut path = env::temp_dir();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        path.push(format!("ccusage-kimi-{name}-{nanos}"));
-        path
-    }
-
-    struct EnvDirGuard {
-        dir: PathBuf,
-    }
-
-    impl EnvDirGuard {
-        fn set(dir: PathBuf) -> Self {
-            env::set_var(KIMI_DATA_DIR_ENV, &dir);
-            Self { dir }
-        }
-    }
-
-    impl Drop for EnvDirGuard {
-        fn drop(&mut self) {
-            env::remove_var(KIMI_DATA_DIR_ENV);
-            let _ = fs::remove_dir_all(&self.dir);
-        }
-    }
+    use ccusage_test_support::{EnvVarGuard, fs_fixture};
 
     #[test]
     fn discovers_wire_jsonl_files_under_sessions_group_session() {
-        let _guard = super::super::KIMI_DATA_DIR_LOCK.lock().unwrap();
-        let kimi_dir = temp_kimi_dir("discover");
-        fs::create_dir_all(kimi_dir.join("sessions/group/session")).unwrap();
-        fs::create_dir_all(kimi_dir.join("sessions/group/session/subagents/agent-1")).unwrap();
-        fs::create_dir_all(kimi_dir.join("sessions/group/session/subagents/agent-1/extra"))
-            .unwrap();
-        fs::create_dir_all(kimi_dir.join("sessions/nested/path/session")).unwrap();
-        fs::write(kimi_dir.join("sessions/group/session/wire.jsonl"), "{}\n").unwrap();
-        fs::write(
-            kimi_dir.join("sessions/group/session/subagents/agent-1/wire.jsonl"),
-            "{}\n",
-        )
-        .unwrap();
-        fs::write(
-            kimi_dir.join("sessions/group/session/subagents/agent-1/extra/wire.jsonl"),
-            "{}\n",
-        )
-        .unwrap();
-        fs::write(kimi_dir.join("sessions/group/session/other.jsonl"), "{}\n").unwrap();
-        fs::write(
-            kimi_dir.join("sessions/nested/path/session/wire.jsonl"),
-            "{}\n",
-        )
-        .unwrap();
-        let _cleanup = EnvDirGuard::set(kimi_dir.clone());
+        let fixture = fs_fixture!({
+            "sessions/group/session/wire.jsonl": "{}\n",
+            "sessions/group/session/subagents/agent-1/wire.jsonl": "{}\n",
+            "sessions/group/session/subagents/agent-1/extra/wire.jsonl": "{}\n",
+            "sessions/group/session/other.jsonl": "{}\n",
+            "sessions/nested/path/session/wire.jsonl": "{}\n",
+        });
+        let _cleanup = EnvVarGuard::set(KIMI_DATA_DIR_ENV, fixture.root());
         let files = discover_wire_files().unwrap();
 
-        let mut expected = vec![
-            kimi_dir.join("sessions/group/session/wire.jsonl"),
-            kimi_dir.join("sessions/group/session/subagents/agent-1/wire.jsonl"),
-        ];
-        expected.sort();
-        assert_eq!(files, expected);
+        assert_eq!(
+            files,
+            vec![
+                fixture.path("sessions/group/session/subagents/agent-1/wire.jsonl"),
+                fixture.path("sessions/group/session/wire.jsonl")
+            ]
+        );
     }
 }

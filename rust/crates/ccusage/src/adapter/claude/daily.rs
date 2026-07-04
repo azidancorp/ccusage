@@ -11,11 +11,11 @@ use memchr::memmem;
 use serde::Deserialize;
 
 use crate::{
-    calculate_cost_for_usage,
+    ModelBreakdown, PricingMap, Result, Speed, TimestampMs, TokenCounts, TokenUsageRaw,
+    UsageSummary, calculate_cost_for_usage,
     cli::{CostMode, SharedArgs},
-    fast::{byte_lines, suffix_string, FxHashMap, SmallIndexVec},
-    format_date_tz, log_level, parse_ts_timestamp, parse_tz, ModelBreakdown, PricingMap, Result,
-    Speed, TimestampMs, TokenCounts, TokenUsageRaw, UsageSummary,
+    fast::{FxHashMap, SmallIndexVec, byte_lines, suffix_string},
+    format_date_tz, log_level, missing_pricing_model_for_usage, parse_ts_timestamp, parse_tz,
 };
 
 use super::{
@@ -38,7 +38,11 @@ pub(super) fn load_daily_summaries_inner(
     let pricing = if shared.mode == CostMode::Display {
         None
     } else {
-        Some(PricingMap::load(shared.offline, log_level() != Some(0)))
+        Some(PricingMap::load_with_overrides(
+            shared.offline,
+            log_level() != Some(0),
+            shared.pricing_overrides.iter(),
+        ))
     };
     let tz = parse_tz(shared.timezone.as_deref());
     let mode = shared.mode;
@@ -55,10 +59,10 @@ pub(super) fn load_daily_summaries_inner(
     let mut deduped = Vec::with_capacity(loaded_files.iter().map(|file| file.entries.len()).sum());
     for loaded_file in loaded_files {
         for entry in loaded_file.entries {
-            if let Some(filter) = project_filter {
-                if entry.project.as_ref() != filter {
-                    continue;
-                }
+            if let Some(filter) = project_filter
+                && entry.project.as_ref() != filter
+            {
+                continue;
             }
             push_deduped_daily_entry(entry, &mut deduped_indexes, &mut deduped);
         }
@@ -113,8 +117,10 @@ struct DailyLoadedEntry {
     usage: TokenUsageRaw,
     cost: f64,
     model: Option<String>,
+    missing_pricing_model: Option<String>,
     message_id: Option<String>,
     request_id: Option<String>,
+    is_sidechain: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,6 +133,7 @@ struct DailyUsageEntry {
     #[serde(rename = "costUSD")]
     cost_usd: Option<f64>,
     request_id: Option<String>,
+    is_sidechain: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -147,6 +154,7 @@ impl DailyUsageLine {
                 session_id: None,
                 cost_usd: entry.data.message.cost_usd,
                 request_id: entry.data.message.request_id,
+                is_sidechain: entry.data.message.is_sidechain,
             },
         }
     }
@@ -170,6 +178,7 @@ struct DailyAgentProgressMessage {
     #[serde(rename = "costUSD")]
     cost_usd: Option<f64>,
     request_id: Option<String>,
+    is_sidechain: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -274,6 +283,13 @@ fn read_daily_usage_file(
             mode,
             pricing,
         );
+        let missing_pricing_model = missing_pricing_model_for_usage(
+            data.message.model.as_deref(),
+            usage,
+            data.cost_usd,
+            mode,
+            pricing,
+        );
         let model = data.message.model.as_ref().and_then(|model| {
             if model == "<synthetic>" {
                 None
@@ -289,8 +305,10 @@ fn read_daily_usage_file(
             usage,
             cost,
             model,
+            missing_pricing_model,
             message_id: data.message.id,
             request_id: data.request_id,
+            is_sidechain: data.is_sidechain,
         });
     }
     loaded_file
@@ -339,7 +357,7 @@ fn is_valid_daily_usage_entry(data: &DailyUsageEntry) -> bool {
 fn daily_usage_token_total(entry: &DailyLoadedEntry) -> u64 {
     entry.usage.input_tokens
         + entry.usage.output_tokens
-        + entry.usage.cache_creation_input_tokens
+        + entry.usage.cache_creation_token_count()
         + entry.usage.cache_read_input_tokens
 }
 
@@ -350,27 +368,31 @@ fn push_deduped_daily_entry(
 ) {
     let dedupe_lookup = entry.message_id.as_deref().map(|message_id| {
         let request_id = entry.request_id.as_deref();
-        let hash = usage_dedupe_hash(message_id, request_id);
-        let existing_index = deduped_indexes.get(&hash).and_then(|indexes| {
-            indexes.iter().copied().find(|&index| {
-                deduped[index].message_id.as_deref() == Some(message_id)
-                    && deduped[index].request_id.as_deref() == request_id
+        let exact_hash = usage_dedupe_hash(message_id, request_id);
+        let existing_index = deduped_indexes
+            .get(&exact_hash)
+            .and_then(|indexes| {
+                indexes.iter().copied().find(|&index| {
+                    deduped[index].message_id.as_deref() == Some(message_id)
+                        && deduped[index].request_id.as_deref() == request_id
+                })
             })
-        });
-        (hash, existing_index)
+            .or_else(|| {
+                // /btw sidechain logs can replay parent messages with new request IDs.
+                let message_hash = usage_dedupe_hash(message_id, None);
+                let candidate_is_sidechain = is_sidechain_daily_entry(&entry);
+                deduped_indexes.get(&message_hash).and_then(|indexes| {
+                    indexes.iter().copied().find(|&index| {
+                        deduped[index].message_id.as_deref() == Some(message_id)
+                            && (candidate_is_sidechain || is_sidechain_daily_entry(&deduped[index]))
+                    })
+                })
+            });
+        (exact_hash, existing_index)
     });
 
     if let Some((_, Some(index))) = dedupe_lookup {
-        let candidate_total = daily_usage_token_total(&entry);
-        let existing_total = daily_usage_token_total(&deduped[index]);
-        let should_replace = if candidate_total != existing_total {
-            candidate_total > existing_total
-        } else if entry.cost != deduped[index].cost {
-            entry.cost > deduped[index].cost
-        } else {
-            entry.usage.speed.is_some() && deduped[index].usage.speed.is_none()
-        };
-        if should_replace {
+        if should_replace_deduped_daily_entry(&entry, &deduped[index]) {
             deduped[index] = entry;
         }
         return;
@@ -379,7 +401,46 @@ fn push_deduped_daily_entry(
     let index = deduped.len();
     deduped.push(entry);
     if let Some((hash, None)) = dedupe_lookup {
-        deduped_indexes.entry(hash).or_default().push(index);
+        push_deduped_daily_index(deduped_indexes, hash, index);
+        if let Some(message_id) = deduped[index].message_id.as_deref() {
+            push_deduped_daily_index(deduped_indexes, usage_dedupe_hash(message_id, None), index);
+        }
+    }
+}
+
+fn should_replace_deduped_daily_entry(
+    candidate: &DailyLoadedEntry,
+    existing: &DailyLoadedEntry,
+) -> bool {
+    let candidate_is_sidechain = is_sidechain_daily_entry(candidate);
+    let existing_is_sidechain = is_sidechain_daily_entry(existing);
+    if candidate_is_sidechain != existing_is_sidechain {
+        return existing_is_sidechain;
+    }
+
+    let candidate_total = daily_usage_token_total(candidate);
+    let existing_total = daily_usage_token_total(existing);
+    if candidate_total != existing_total {
+        return candidate_total > existing_total;
+    }
+    if candidate.cost != existing.cost {
+        return candidate.cost > existing.cost;
+    }
+    candidate.usage.speed.is_some() && existing.usage.speed.is_none()
+}
+
+fn is_sidechain_daily_entry(entry: &DailyLoadedEntry) -> bool {
+    entry.is_sidechain == Some(true)
+}
+
+fn push_deduped_daily_index(
+    deduped_indexes: &mut FxHashMap<u64, SmallIndexVec>,
+    hash: u64,
+    index: usize,
+) {
+    let indexes = deduped_indexes.entry(hash).or_default();
+    if !indexes.contains(&index) {
+        indexes.push(index);
     }
 }
 
@@ -397,6 +458,7 @@ impl DailyAccumulator {
         self.counts.add_usage(entry.usage);
         self.cost += entry.cost;
         if let Some(model) = &entry.model {
+            let model = crate::model_aliases::resolve_model_name(model).into_owned();
             let index = if let Some(index) = self.breakdown_indexes.get(model.as_str()) {
                 *index
             } else {
@@ -412,9 +474,12 @@ impl DailyAccumulator {
             let breakdown = &mut self.breakdowns[index];
             breakdown.input_tokens += entry.usage.input_tokens;
             breakdown.output_tokens += entry.usage.output_tokens;
-            breakdown.cache_creation_tokens += entry.usage.cache_creation_input_tokens;
+            breakdown.cache_creation_tokens += entry.usage.cache_creation_token_count();
             breakdown.cache_read_tokens += entry.usage.cache_read_input_tokens;
             breakdown.cost += entry.cost;
+            if entry.missing_pricing_model.is_some() {
+                breakdown.missing_pricing = true;
+            }
         }
     }
 
@@ -427,6 +492,7 @@ impl DailyAccumulator {
             session_id: None,
             project_path: None,
             last_activity: None,
+            first_activity: None,
             input_tokens: self.counts.input_tokens,
             output_tokens: self.counts.output_tokens,
             cache_creation_tokens: self.counts.cache_creation_tokens,
@@ -439,6 +505,104 @@ impl DailyAccumulator {
             model_breakdowns: self.breakdowns,
             project: None,
             versions: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::{DailyLoadedEntry, push_deduped_daily_entry};
+    use crate::TokenUsageRaw;
+
+    #[test]
+    fn keeps_parent_daily_usage_when_sidechain_replays_message_with_new_request_id() {
+        let mut deduped_indexes = Default::default();
+        let mut deduped = Vec::new();
+
+        push_deduped_daily_entry(
+            daily_loaded_entry(DailyEntryFixture {
+                message_id: "msg-parent",
+                request_id: "req-parent",
+                is_sidechain: false,
+                cache_read_tokens: 20,
+                output_tokens: 10,
+            }),
+            &mut deduped_indexes,
+            &mut deduped,
+        );
+        push_deduped_daily_entry(
+            daily_loaded_entry(DailyEntryFixture {
+                message_id: "msg-parent",
+                request_id: "req-sidechain-replay",
+                is_sidechain: true,
+                cache_read_tokens: 50_000,
+                output_tokens: 10,
+            }),
+            &mut deduped_indexes,
+            &mut deduped,
+        );
+        push_deduped_daily_entry(
+            daily_loaded_entry(DailyEntryFixture {
+                message_id: "msg-sidechain-answer",
+                request_id: "req-sidechain-answer",
+                is_sidechain: true,
+                cache_read_tokens: 700,
+                output_tokens: 30,
+            }),
+            &mut deduped_indexes,
+            &mut deduped,
+        );
+
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].message_id.as_deref(), Some("msg-parent"));
+        assert_eq!(deduped[0].request_id.as_deref(), Some("req-parent"));
+        assert_eq!(deduped[0].usage.cache_read_input_tokens, 20);
+        assert_eq!(
+            deduped[1].message_id.as_deref(),
+            Some("msg-sidechain-answer")
+        );
+        assert_eq!(deduped[1].usage.cache_read_input_tokens, 700);
+    }
+
+    #[test]
+    fn propagates_sidechain_metadata_from_agent_progress_lines() {
+        let data = serde_json::from_str::<super::DailyUsageLine>(
+            r#"{"data":{"message":{"timestamp":"2026-03-29T07:00:00.000Z","requestId":"req-sidechain","isSidechain":true,"message":{"usage":{"input_tokens":0,"output_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":20},"model":"claude-sonnet-4-20250514","id":"msg-sidechain"}}}}"#,
+        )
+        .unwrap()
+        .into_entry();
+
+        assert_eq!(data.is_sidechain, Some(true));
+    }
+
+    struct DailyEntryFixture {
+        message_id: &'static str,
+        request_id: &'static str,
+        is_sidechain: bool,
+        cache_read_tokens: u64,
+        output_tokens: u64,
+    }
+
+    fn daily_loaded_entry(fixture: DailyEntryFixture) -> DailyLoadedEntry {
+        DailyLoadedEntry {
+            date: "2026-03-29".to_string(),
+            project: Arc::from("project-a"),
+            usage: TokenUsageRaw {
+                input_tokens: 0,
+                output_tokens: fixture.output_tokens,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: fixture.cache_read_tokens,
+                speed: None,
+                cache_creation: None,
+            },
+            cost: 0.0,
+            model: Some("claude-sonnet-4-20250514".to_string()),
+            missing_pricing_model: None,
+            message_id: Some(fixture.message_id.to_string()),
+            request_id: Some(fixture.request_id.to_string()),
+            is_sidechain: Some(fixture.is_sidechain),
         }
     }
 }

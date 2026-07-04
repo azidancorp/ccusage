@@ -1,9 +1,9 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::{
+    BucketKind, LoadedEntry, Result, UsageSummary,
     cli::{AgentReportKind, WeekDay},
-    summarize_by_key, summarize_summaries_by_bucket, totals_json, BucketKind, LoadedEntry, Result,
-    UsageSummary,
+    summarize_by_key, summarize_summaries_by_bucket, totals_json,
 };
 
 pub(crate) fn report_from_rows(rows: &[UsageSummary], kind: AgentReportKind) -> Value {
@@ -87,6 +87,7 @@ mod tests {
                         cache_creation_input_tokens: 20,
                         cache_read_input_tokens: 50,
                         speed: None,
+                        cache_creation: None,
                     },
                     model: Some("claude-sonnet-4-20250514".to_string()),
                     id: Some("hermes:session-1".to_string()),
@@ -94,6 +95,7 @@ mod tests {
                 cost_usd: Some(0.34),
                 request_id: None,
                 is_api_error_message: None,
+                is_sidechain: None,
             },
             timestamp: crate::parse_ts_timestamp("2025-06-15T15:06:40.250Z").unwrap(),
             date: "2025-06-15".to_string(),
@@ -106,6 +108,7 @@ mod tests {
             message_count: Some(42),
             model: Some("claude-sonnet-4-20250514".to_string()),
             usage_limit_reset_time: None,
+            missing_pricing_model: None,
         };
         let rows = summarize_entries(&[entry], AgentReportKind::Daily).unwrap();
         let report = report_from_rows(&rows, AgentReportKind::Daily);

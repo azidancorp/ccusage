@@ -302,7 +302,8 @@ Returns structured data including full paths:
       "cacheCreationTokens": 1234,
       "cacheReadTokens": 9876,
       "totalCost": 0.12,
-      "lastActivity": "2026-05-16",
+      "firstActivity": "2026-05-15T09:30:00.000Z",
+      "lastActivity": "2026-05-16T17:45:30.000Z",
       "modelsUsed": ["claude-opus-4-1-20250805"],
       "modelBreakdowns": [...]
     }
@@ -331,5 +332,5 @@ ccusage pi session --since 2026-05-09
 
 ## Related
 
-- [ccusage](https://github.com/ryoppippi/ccusage) - Main usage analysis tool for coding (agent) CLIs
+- [ccusage](https://github.com/ccusage/ccusage) - Main usage analysis tool for coding (agent) CLIs
 - [pi-agent](https://github.com/badlogic/pi-mono) - Alternative Claude coding (agent) CLI

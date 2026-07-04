@@ -3,8 +3,8 @@ use std::{fs, path::Path};
 use serde_json::Value;
 
 use crate::{
-    apply_total_token_fallback, calculate_cost_for_usage, cli::CostMode, format_rfc3339_millis,
-    parse_ts_timestamp, PricingMap, Result, TokenUsageRaw,
+    PricingMap, Result, TokenUsageRaw, apply_total_token_fallback, calculate_cost_for_usage,
+    cli::CostMode, format_rfc3339_millis, missing_pricing_model_for_candidates, parse_ts_timestamp,
 };
 
 const DEFAULT_CODEBUFF_MODEL: &str = "codebuff-unknown";
@@ -38,11 +38,8 @@ struct CodebuffContext {
 }
 
 pub(super) fn load_chat_file(path: &Path) -> Result<Vec<CodebuffEntry>> {
-    let content = fs::read_to_string(path)?;
-    let Ok(messages) = serde_json::from_str::<Value>(&content) else {
-        return Ok(Vec::new());
-    };
-    let Some(messages) = messages.as_array() else {
+    let content = fs::read(path)?;
+    let Ok(messages) = serde_json::from_slice::<Vec<Value>>(&content) else {
         return Ok(Vec::new());
     };
     let context = derive_context(path);
@@ -88,6 +85,7 @@ pub(super) fn load_chat_file(path: &Path) -> Result<Vec<CodebuffEntry>> {
                 cache_creation_input_tokens: usage.cache_creation_input_tokens,
                 cache_read_input_tokens: usage.cache_read_input_tokens,
                 speed: None,
+                cache_creation: None,
             },
             extra_total_tokens: usage.extra_total_tokens,
             dedup_key,
@@ -251,6 +249,7 @@ pub(super) fn parse_usage_object(value: Option<&Value>) -> AssistantUsage {
         cache_creation_input_tokens: usage.cache_creation_input_tokens,
         cache_read_input_tokens: usage.cache_read_input_tokens,
         speed: None,
+        cache_creation: None,
     };
     let (raw_usage, extra_total_tokens) =
         apply_total_token_fallback(raw_usage, usage.extra_total_tokens, total_tokens);
@@ -396,6 +395,7 @@ pub(super) fn calculate_codebuff_cost(entry: &CodebuffEntry, pricing: &PricingMa
             .usage
             .output_tokens
             .saturating_add(entry.extra_total_tokens),
+        cache_creation: None,
         ..entry.usage
     };
     let raw = calculate_cost_for_usage(
@@ -416,6 +416,30 @@ pub(super) fn calculate_codebuff_cost(entry: &CodebuffEntry, pricing: &PricingMa
         usage,
         None,
         CostMode::Calculate,
+        Some(pricing),
+    )
+}
+
+pub(super) fn missing_codebuff_pricing(
+    entry: &CodebuffEntry,
+    pricing: &PricingMap,
+) -> Option<String> {
+    let usage = TokenUsageRaw {
+        output_tokens: entry
+            .usage
+            .output_tokens
+            .saturating_add(entry.extra_total_tokens),
+        cache_creation: None,
+        ..entry.usage
+    };
+    let mut candidates = vec![entry.model.clone()];
+    if entry.provider != "unknown" && !entry.model.starts_with(&format!("{}/", entry.provider)) {
+        candidates.push(format!("{}/{}", entry.provider, entry.model));
+    }
+    missing_pricing_model_for_candidates(
+        &entry.model,
+        candidates,
+        crate::total_usage_tokens(usage),
         Some(pricing),
     )
 }

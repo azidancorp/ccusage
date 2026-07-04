@@ -1,6 +1,6 @@
 ---
 source: crates/ccusage/src/config_schema.rs
-assertion_line: 1257
+assertion_line: 1293
 expression: "json!({\n    \"rootRef\": schema[\"$ref\"], \"rootProperties\":\n    definition_properties(&schema, \"ccusage-config\"),\n    \"rootAdditionalProperties\":\n    schema[\"definitions\"][\"ccusage-config\"][\"additionalProperties\"],\n    \"defaults\": schema_node(&schema, &[\"defaults\"]), \"rootDaily\":\n    schema_node(&schema, &[\"commands\", \"daily\"]), \"claudeStatusline\":\n    schema_node(&schema, &[\"claude\", \"commands\", \"statusline\"]),\n    \"codexDefaults\": schema_node(&schema, &[\"codex\", \"defaults\"]),\n    \"opencodeWeekly\":\n    schema_node(&schema, &[\"opencode\", \"commands\", \"weekly\"]), \"piDefaults\":\n    schema_node(&schema, &[\"pi\", \"defaults\"]), \"openclawDefaults\":\n    schema_node(&schema, &[\"openclaw\", \"defaults\"]),\n})"
 ---
 {
@@ -46,6 +46,14 @@ expression: "json!({\n    \"rootRef\": schema[\"$ref\"], \"rootProperties\":\n  
         "description": "Show statusline debug information.",
         "markdownDescription": "Show statusline debug information.",
         "type": "boolean"
+      },
+      "modelLabelAliases": {
+        "additionalProperties": {
+          "type": "string"
+        },
+        "description": "Map model identifiers to short display labels.",
+        "markdownDescription": "Map model identifiers to short display labels.",
+        "type": "object"
       },
       "noCache": {
         "default": false,
@@ -153,6 +161,11 @@ expression: "json!({\n    \"rootRef\": schema[\"$ref\"], \"rootProperties\":\n  
         "markdownDescription": "Disable colored output.",
         "type": "boolean"
       },
+      "noCost": {
+        "description": "Hide cost information in table and JSON output.",
+        "markdownDescription": "Hide cost information in table and JSON output.",
+        "type": "boolean"
+      },
       "noOffline": {
         "description": "Disable cached pricing data where supported.",
         "markdownDescription": "Disable cached pricing data where supported.",
@@ -171,6 +184,58 @@ expression: "json!({\n    \"rootRef\": schema[\"$ref\"], \"rootProperties\":\n  
         ],
         "markdownDescription": "Sort order.",
         "type": "string"
+      },
+      "pricingOverrides": {
+        "additionalProperties": {
+          "additionalProperties": false,
+          "properties": {
+            "cacheCreationInputTokenCost": {
+              "format": "double",
+              "type": "number"
+            },
+            "cacheCreationInputTokenCostAbove200kTokens": {
+              "format": "double",
+              "type": "number"
+            },
+            "cacheReadInputTokenCost": {
+              "format": "double",
+              "type": "number"
+            },
+            "cacheReadInputTokenCostAbove200kTokens": {
+              "format": "double",
+              "type": "number"
+            },
+            "fastMultiplier": {
+              "format": "double",
+              "type": "number"
+            },
+            "inputCostPerToken": {
+              "format": "double",
+              "type": "number"
+            },
+            "inputCostPerTokenAbove200kTokens": {
+              "format": "double",
+              "type": "number"
+            },
+            "maxInputTokens": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "outputCostPerToken": {
+              "format": "double",
+              "type": "number"
+            },
+            "outputCostPerTokenAbove200kTokens": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          "type": "object"
+        },
+        "description": "Runtime pricing overrides keyed by raw model name.",
+        "markdownDescription": "Runtime pricing overrides keyed by raw model name.",
+        "type": "object"
       },
       "since": {
         "description": "Filter from date (YYYY-MM-DD or YYYYMMDD).",
@@ -277,6 +342,12 @@ expression: "json!({\n    \"rootRef\": schema[\"$ref\"], \"rootProperties\":\n  
         "markdownDescription": "Disable colored output.",
         "type": "boolean"
       },
+      "noCost": {
+        "default": false,
+        "description": "Hide cost information in table and JSON output.",
+        "markdownDescription": "Hide cost information in table and JSON output.",
+        "type": "boolean"
+      },
       "noOffline": {
         "default": false,
         "description": "Disable cached pricing data where supported.",
@@ -298,6 +369,58 @@ expression: "json!({\n    \"rootRef\": schema[\"$ref\"], \"rootProperties\":\n  
         ],
         "markdownDescription": "Sort order.",
         "type": "string"
+      },
+      "pricingOverrides": {
+        "additionalProperties": {
+          "additionalProperties": false,
+          "properties": {
+            "cacheCreationInputTokenCost": {
+              "format": "double",
+              "type": "number"
+            },
+            "cacheCreationInputTokenCostAbove200kTokens": {
+              "format": "double",
+              "type": "number"
+            },
+            "cacheReadInputTokenCost": {
+              "format": "double",
+              "type": "number"
+            },
+            "cacheReadInputTokenCostAbove200kTokens": {
+              "format": "double",
+              "type": "number"
+            },
+            "fastMultiplier": {
+              "format": "double",
+              "type": "number"
+            },
+            "inputCostPerToken": {
+              "format": "double",
+              "type": "number"
+            },
+            "inputCostPerTokenAbove200kTokens": {
+              "format": "double",
+              "type": "number"
+            },
+            "maxInputTokens": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "outputCostPerToken": {
+              "format": "double",
+              "type": "number"
+            },
+            "outputCostPerTokenAbove200kTokens": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          "type": "object"
+        },
+        "description": "Runtime pricing overrides keyed by raw model name.",
+        "markdownDescription": "Runtime pricing overrides keyed by raw model name.",
+        "type": "object"
       },
       "since": {
         "description": "Filter from date (YYYY-MM-DD or YYYYMMDD).",
@@ -383,6 +506,11 @@ expression: "json!({\n    \"rootRef\": schema[\"$ref\"], \"rootProperties\":\n  
         "markdownDescription": "Disable colored output.",
         "type": "boolean"
       },
+      "noCost": {
+        "description": "Hide cost information in table and JSON output.",
+        "markdownDescription": "Hide cost information in table and JSON output.",
+        "type": "boolean"
+      },
       "noOffline": {
         "description": "Disable cached pricing data where supported.",
         "markdownDescription": "Disable cached pricing data where supported.",
@@ -406,6 +534,58 @@ expression: "json!({\n    \"rootRef\": schema[\"$ref\"], \"rootProperties\":\n  
         ],
         "markdownDescription": "Sort order.",
         "type": "string"
+      },
+      "pricingOverrides": {
+        "additionalProperties": {
+          "additionalProperties": false,
+          "properties": {
+            "cacheCreationInputTokenCost": {
+              "format": "double",
+              "type": "number"
+            },
+            "cacheCreationInputTokenCostAbove200kTokens": {
+              "format": "double",
+              "type": "number"
+            },
+            "cacheReadInputTokenCost": {
+              "format": "double",
+              "type": "number"
+            },
+            "cacheReadInputTokenCostAbove200kTokens": {
+              "format": "double",
+              "type": "number"
+            },
+            "fastMultiplier": {
+              "format": "double",
+              "type": "number"
+            },
+            "inputCostPerToken": {
+              "format": "double",
+              "type": "number"
+            },
+            "inputCostPerTokenAbove200kTokens": {
+              "format": "double",
+              "type": "number"
+            },
+            "maxInputTokens": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "outputCostPerToken": {
+              "format": "double",
+              "type": "number"
+            },
+            "outputCostPerTokenAbove200kTokens": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          "type": "object"
+        },
+        "description": "Runtime pricing overrides keyed by raw model name.",
+        "markdownDescription": "Runtime pricing overrides keyed by raw model name.",
+        "type": "object"
       },
       "since": {
         "description": "Filter from date (YYYY-MM-DD or YYYYMMDD).",
@@ -499,6 +679,12 @@ expression: "json!({\n    \"rootRef\": schema[\"$ref\"], \"rootProperties\":\n  
         "markdownDescription": "Disable colored output.",
         "type": "boolean"
       },
+      "noCost": {
+        "default": false,
+        "description": "Hide cost information in table and JSON output.",
+        "markdownDescription": "Hide cost information in table and JSON output.",
+        "type": "boolean"
+      },
       "noOffline": {
         "default": false,
         "description": "Disable cached pricing data where supported.",
@@ -520,6 +706,58 @@ expression: "json!({\n    \"rootRef\": schema[\"$ref\"], \"rootProperties\":\n  
         ],
         "markdownDescription": "Sort order.",
         "type": "string"
+      },
+      "pricingOverrides": {
+        "additionalProperties": {
+          "additionalProperties": false,
+          "properties": {
+            "cacheCreationInputTokenCost": {
+              "format": "double",
+              "type": "number"
+            },
+            "cacheCreationInputTokenCostAbove200kTokens": {
+              "format": "double",
+              "type": "number"
+            },
+            "cacheReadInputTokenCost": {
+              "format": "double",
+              "type": "number"
+            },
+            "cacheReadInputTokenCostAbove200kTokens": {
+              "format": "double",
+              "type": "number"
+            },
+            "fastMultiplier": {
+              "format": "double",
+              "type": "number"
+            },
+            "inputCostPerToken": {
+              "format": "double",
+              "type": "number"
+            },
+            "inputCostPerTokenAbove200kTokens": {
+              "format": "double",
+              "type": "number"
+            },
+            "maxInputTokens": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "outputCostPerToken": {
+              "format": "double",
+              "type": "number"
+            },
+            "outputCostPerTokenAbove200kTokens": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          "type": "object"
+        },
+        "description": "Runtime pricing overrides keyed by raw model name.",
+        "markdownDescription": "Runtime pricing overrides keyed by raw model name.",
+        "type": "object"
       },
       "since": {
         "description": "Filter from date (YYYY-MM-DD or YYYYMMDD).",
@@ -605,6 +843,11 @@ expression: "json!({\n    \"rootRef\": schema[\"$ref\"], \"rootProperties\":\n  
         "markdownDescription": "Disable colored output.",
         "type": "boolean"
       },
+      "noCost": {
+        "description": "Hide cost information in table and JSON output.",
+        "markdownDescription": "Hide cost information in table and JSON output.",
+        "type": "boolean"
+      },
       "noOffline": {
         "description": "Disable cached pricing data where supported.",
         "markdownDescription": "Disable cached pricing data where supported.",
@@ -628,6 +871,58 @@ expression: "json!({\n    \"rootRef\": schema[\"$ref\"], \"rootProperties\":\n  
         "description": "Path or comma-separated paths to pi-agent sessions directories.",
         "markdownDescription": "Path or comma-separated paths to pi-agent sessions directories.",
         "type": "string"
+      },
+      "pricingOverrides": {
+        "additionalProperties": {
+          "additionalProperties": false,
+          "properties": {
+            "cacheCreationInputTokenCost": {
+              "format": "double",
+              "type": "number"
+            },
+            "cacheCreationInputTokenCostAbove200kTokens": {
+              "format": "double",
+              "type": "number"
+            },
+            "cacheReadInputTokenCost": {
+              "format": "double",
+              "type": "number"
+            },
+            "cacheReadInputTokenCostAbove200kTokens": {
+              "format": "double",
+              "type": "number"
+            },
+            "fastMultiplier": {
+              "format": "double",
+              "type": "number"
+            },
+            "inputCostPerToken": {
+              "format": "double",
+              "type": "number"
+            },
+            "inputCostPerTokenAbove200kTokens": {
+              "format": "double",
+              "type": "number"
+            },
+            "maxInputTokens": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "outputCostPerToken": {
+              "format": "double",
+              "type": "number"
+            },
+            "outputCostPerTokenAbove200kTokens": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          "type": "object"
+        },
+        "description": "Runtime pricing overrides keyed by raw model name.",
+        "markdownDescription": "Runtime pricing overrides keyed by raw model name.",
+        "type": "object"
       },
       "since": {
         "description": "Filter from date (YYYY-MM-DD or YYYYMMDD).",
@@ -718,6 +1013,11 @@ expression: "json!({\n    \"rootRef\": schema[\"$ref\"], \"rootProperties\":\n  
         "markdownDescription": "Disable colored output.",
         "type": "boolean"
       },
+      "noCost": {
+        "description": "Hide cost information in table and JSON output.",
+        "markdownDescription": "Hide cost information in table and JSON output.",
+        "type": "boolean"
+      },
       "noOffline": {
         "description": "Disable cached pricing data where supported.",
         "markdownDescription": "Disable cached pricing data where supported.",
@@ -736,6 +1036,58 @@ expression: "json!({\n    \"rootRef\": schema[\"$ref\"], \"rootProperties\":\n  
         ],
         "markdownDescription": "Sort order.",
         "type": "string"
+      },
+      "pricingOverrides": {
+        "additionalProperties": {
+          "additionalProperties": false,
+          "properties": {
+            "cacheCreationInputTokenCost": {
+              "format": "double",
+              "type": "number"
+            },
+            "cacheCreationInputTokenCostAbove200kTokens": {
+              "format": "double",
+              "type": "number"
+            },
+            "cacheReadInputTokenCost": {
+              "format": "double",
+              "type": "number"
+            },
+            "cacheReadInputTokenCostAbove200kTokens": {
+              "format": "double",
+              "type": "number"
+            },
+            "fastMultiplier": {
+              "format": "double",
+              "type": "number"
+            },
+            "inputCostPerToken": {
+              "format": "double",
+              "type": "number"
+            },
+            "inputCostPerTokenAbove200kTokens": {
+              "format": "double",
+              "type": "number"
+            },
+            "maxInputTokens": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "outputCostPerToken": {
+              "format": "double",
+              "type": "number"
+            },
+            "outputCostPerTokenAbove200kTokens": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          "type": "object"
+        },
+        "description": "Runtime pricing overrides keyed by raw model name.",
+        "markdownDescription": "Runtime pricing overrides keyed by raw model name.",
+        "type": "object"
       },
       "project": {
         "description": "Filter to a project name or path.",

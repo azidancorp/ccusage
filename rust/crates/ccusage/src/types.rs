@@ -15,6 +15,7 @@ pub(crate) struct UsageEntry {
     pub(crate) cost_usd: Option<f64>,
     pub(crate) request_id: Option<String>,
     pub(crate) is_api_error_message: Option<bool>,
+    pub(crate) is_sidechain: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -33,6 +34,26 @@ pub(crate) struct TokenUsageRaw {
     #[serde(default)]
     pub(crate) cache_read_input_tokens: u64,
     pub(crate) speed: Option<Speed>,
+    #[serde(default)]
+    pub(crate) cache_creation: Option<CacheCreationRaw>,
+}
+
+impl TokenUsageRaw {
+    pub(crate) fn cache_creation_token_count(&self) -> u64 {
+        if let Some(b) = &self.cache_creation {
+            b.ephemeral_5m_input_tokens + b.ephemeral_1h_input_tokens
+        } else {
+            self.cache_creation_input_tokens
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub(crate) struct CacheCreationRaw {
+    #[serde(default)]
+    pub(crate) ephemeral_5m_input_tokens: u64,
+    #[serde(default)]
+    pub(crate) ephemeral_1h_input_tokens: u64,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -56,7 +77,7 @@ impl TokenCounts {
     pub(crate) fn add_usage(&mut self, usage: TokenUsageRaw) {
         self.input_tokens += usage.input_tokens;
         self.output_tokens += usage.output_tokens;
-        self.cache_creation_tokens += usage.cache_creation_input_tokens;
+        self.cache_creation_tokens += usage.cache_creation_token_count();
         self.cache_read_tokens += usage.cache_read_input_tokens;
     }
 
@@ -69,7 +90,7 @@ impl TokenCounts {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ModelBreakdown {
     pub(crate) model_name: String,
@@ -77,9 +98,11 @@ pub(crate) struct ModelBreakdown {
     pub(crate) output_tokens: u64,
     pub(crate) cache_creation_tokens: u64,
     pub(crate) cache_read_tokens: u64,
-    #[serde(default, skip_serializing)]
+    #[serde(skip_serializing)]
     pub(crate) extra_total_tokens: u64,
     pub(crate) cost: f64,
+    #[serde(skip_serializing)]
+    pub(crate) missing_pricing: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +119,7 @@ pub(crate) struct LoadedEntry {
     pub(crate) message_count: Option<u64>,
     pub(crate) model: Option<String>,
     pub(crate) usage_limit_reset_time: Option<TimestampMs>,
+    pub(crate) missing_pricing_model: Option<String>,
 }
 
 #[derive(Debug)]
@@ -113,7 +137,7 @@ pub(crate) struct CodexRawUsage {
     pub(crate) total_tokens: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CodexTokenUsageEvent {
     pub(crate) session_id: String,
     pub(crate) timestamp: String,
@@ -133,7 +157,6 @@ pub(crate) struct CodexModelUsage {
     pub(crate) output_tokens: u64,
     pub(crate) reasoning_output_tokens: u64,
     pub(crate) total_tokens: u64,
-    pub(crate) cost: Option<f64>,
     pub(crate) is_fallback: bool,
 }
 
@@ -144,7 +167,6 @@ pub(crate) struct CodexGroup {
     pub(crate) output_tokens: u64,
     pub(crate) reasoning_output_tokens: u64,
     pub(crate) total_tokens: u64,
-    pub(crate) cost: Option<f64>,
     pub(crate) models: BTreeMap<String, CodexModelUsage>,
     pub(crate) last_activity: Option<String>,
 }
@@ -164,6 +186,8 @@ pub(crate) struct UsageSummary {
     pub(crate) project_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) last_activity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) first_activity: Option<String>,
     pub(crate) input_tokens: u64,
     pub(crate) output_tokens: u64,
     pub(crate) cache_creation_tokens: u64,

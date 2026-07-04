@@ -1,9 +1,9 @@
 use serde_json::Value;
 
 use crate::{
+    BucketKind, LoadedEntry, Result, UsageSummary,
     cli::{AgentReportKind, WeekDay},
-    summarize_by_key, summarize_summaries_by_bucket, totals_json, BucketKind, LoadedEntry, Result,
-    UsageSummary,
+    summarize_by_key, summarize_summaries_by_bucket, totals_json,
 };
 
 pub(crate) fn report_from_rows(rows: &[UsageSummary], kind: AgentReportKind) -> Value {
@@ -95,6 +95,7 @@ mod tests {
                         cache_creation_input_tokens: 0,
                         cache_read_input_tokens: 0,
                         speed: None,
+                        cache_creation: None,
                     },
                     model: Some("claude-sonnet-4-20250514".to_string()),
                     id: Some("session-a".to_string()),
@@ -102,6 +103,7 @@ mod tests {
                 cost_usd: None,
                 request_id: None,
                 is_api_error_message: None,
+                is_sidechain: None,
             },
             timestamp: crate::parse_ts_timestamp("2026-05-01T01:02:03.000Z").unwrap(),
             date: "2026-05-01".to_string(),
@@ -112,6 +114,7 @@ mod tests {
             credits: None,
             model: Some("claude-sonnet-4-20250514".to_string()),
             usage_limit_reset_time: None,
+            missing_pricing_model: None,
             extra_total_tokens: 30,
             message_count: None,
         };

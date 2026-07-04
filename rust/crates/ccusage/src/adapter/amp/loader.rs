@@ -1,7 +1,6 @@
-use std::path::PathBuf;
-
 use crate::{
-    cli::SharedArgs, collect_files_with_extension, parse_tz, LoadedEntry, PricingMap, Result,
+    LoadedEntry, PricingMap, Result, cli::SharedArgs, collect_files_with_extension, debug_log,
+    parse_tz, read_files_parallel,
 };
 
 use super::{parser, paths};
@@ -19,25 +18,21 @@ fn load_entries_inner(shared: &SharedArgs, pricing: &PricingMap) -> Result<Vec<L
         let threads_dir = path.join("threads");
         let mut files = Vec::new();
         collect_files_with_extension(&threads_dir, "json", &mut files);
-        for file in files {
-            entries.extend(parser::read_thread_file(
-                &file,
-                tz.as_ref(),
-                shared.mode,
-                Some(pricing),
-            )?);
+        let per_file = read_files_parallel(&files, shared.single_thread, |file| {
+            parser::read_thread_file(file, tz.as_ref(), shared.mode, Some(pricing)).unwrap_or_else(
+                |error| {
+                    debug_log(
+                        shared,
+                        format!("Failed to read Amp thread file {}: {error}", file.display()),
+                    );
+                    Vec::new()
+                },
+            )
+        });
+        for file_entries in per_file {
+            entries.extend(file_entries);
         }
     }
     entries.sort_by_key(|entry| entry.timestamp);
     Ok(entries)
-}
-
-pub(crate) fn source_files() -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    for path in paths::paths()? {
-        collect_files_with_extension(&path.join("threads"), "json", &mut files);
-    }
-    files.sort();
-    files.dedup();
-    Ok(files)
 }

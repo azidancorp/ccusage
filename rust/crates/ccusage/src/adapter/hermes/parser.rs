@@ -3,8 +3,9 @@ use std::{collections::HashSet, sync::Arc};
 use jiff::tz::TimeZone as JiffTimeZone;
 
 use crate::{
-    calculate_cost_for_usage, cli::CostMode, format_date_tz, format_rfc3339_millis, LoadedEntry,
-    PricingMap, TimestampMs, TokenUsageRaw, UsageEntry, UsageMessage,
+    LoadedEntry, PricingMap, TimestampMs, TokenUsageRaw, UsageEntry, UsageMessage,
+    calculate_cost_for_usage, cli::CostMode, format_date_tz, format_rfc3339_millis,
+    missing_pricing_model_for_candidates,
 };
 
 pub(super) struct HermesEntry {
@@ -58,6 +59,7 @@ pub(super) fn read_session_row(statement: &sqlite::Statement<'_>) -> Option<Herm
             cache_creation_input_tokens: cache_creation_tokens,
             cache_read_input_tokens: cache_read_tokens,
             speed: None,
+            cache_creation: None,
         },
         reasoning_tokens,
         message_count,
@@ -143,6 +145,7 @@ pub(super) fn to_loaded_entry(
     pricing: &PricingMap,
 ) -> LoadedEntry {
     let cost = calculate_hermes_cost(&entry, pricing);
+    let missing_pricing_model = missing_hermes_pricing(&entry, pricing);
     let data = UsageEntry {
         session_id: Some(entry.session_id.clone()),
         timestamp: entry.timestamp_text.clone(),
@@ -155,6 +158,7 @@ pub(super) fn to_loaded_entry(
         cost_usd: entry.cost_usd,
         request_id: None,
         is_api_error_message: None,
+        is_sidechain: None,
     };
     LoadedEntry {
         date: format_date_tz(entry.timestamp, tz),
@@ -168,6 +172,7 @@ pub(super) fn to_loaded_entry(
         message_count: Some(entry.message_count),
         model: Some(entry.model),
         usage_limit_reset_time: None,
+        missing_pricing_model,
         data,
     }
 }
@@ -178,6 +183,7 @@ fn calculate_hermes_cost(entry: &HermesEntry, pricing: &PricingMap) -> f64 {
     }
     let usage = TokenUsageRaw {
         output_tokens: entry.usage.output_tokens + entry.reasoning_tokens,
+        cache_creation: None,
         ..entry.usage
     };
     for candidate in model_candidates(entry) {
@@ -193,6 +199,23 @@ fn calculate_hermes_cost(entry: &HermesEntry, pricing: &PricingMap) -> f64 {
         }
     }
     0.0
+}
+
+fn missing_hermes_pricing(entry: &HermesEntry, pricing: &PricingMap) -> Option<String> {
+    if entry.cost_usd.is_some_and(|cost| cost > 0.0) {
+        return None;
+    }
+    let usage = TokenUsageRaw {
+        output_tokens: entry.usage.output_tokens + entry.reasoning_tokens,
+        cache_creation: None,
+        ..entry.usage
+    };
+    missing_pricing_model_for_candidates(
+        &entry.model,
+        model_candidates(entry),
+        crate::total_usage_tokens(usage),
+        Some(pricing),
+    )
 }
 
 fn model_candidates(entry: &HermesEntry) -> Vec<String> {
@@ -228,6 +251,7 @@ mod tests {
                     cache_creation_input_tokens: 0,
                     cache_read_input_tokens: 0,
                     speed: None,
+                    cache_creation: None,
                 },
                 reasoning_tokens: 50,
                 message_count: 1,
@@ -256,6 +280,7 @@ mod tests {
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 3_339_776,
                 speed: None,
+                cache_creation: None,
             },
             reasoning_tokens: 3_216,
             message_count: 72,
@@ -283,6 +308,7 @@ mod tests {
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 0,
                 speed: None,
+                cache_creation: None,
             },
             reasoning_tokens: 0,
             message_count: 1,

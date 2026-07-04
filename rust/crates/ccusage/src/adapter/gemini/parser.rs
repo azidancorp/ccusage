@@ -1,16 +1,92 @@
 use std::{collections::HashMap, fs, path::Path, sync::Arc};
 
 use jiff::tz::TimeZone as JiffTimeZone;
+use serde::Deserialize;
 use serde_json::{Map, Value};
 
+use super::super::jsonl;
 use crate::{
+    LoadedEntry, PricingMap, Result, TimestampMs, TokenUsageRaw, UsageEntry, UsageMessage,
     apply_total_token_fallback, calculate_cost_for_usage, cli::CostMode, format_date_tz,
-    non_empty_json_string, LoadedEntry, PricingMap, Result, TimestampMs, TokenUsageRaw, UsageEntry,
-    UsageMessage,
+    missing_pricing_model_for_candidates, non_empty_json_string,
 };
 
 const DEFAULT_MODEL: &str = "unknown";
 const PROVIDER_PREFIXES: [&str; 4] = ["google", "gemini", "vertex_ai", "openrouter/google"];
+
+/// A Gemini log record envelope, used both for whole-file JSON documents and for
+/// individual JSONL lines. Only the fields ccusage consumes are declared; serde
+/// skips everything else.
+///
+/// Token counts are intentionally kept as raw [`Value`] trees (`tokens`,
+/// `stats`, `result`) because [`parse_tokens`] accepts many key aliases and
+/// truncates floating-point token counts, semantics that differ from the shared
+/// integer-only [`jsonl::lenient_u64`] helper.
+#[derive(Debug, Default, Deserialize)]
+struct GeminiRecord {
+    #[serde(default, deserialize_with = "lenient_str")]
+    r#type: Option<String>,
+    #[serde(default, deserialize_with = "jsonl::non_empty_string")]
+    #[serde(rename = "sessionId")]
+    session_id_camel: Option<String>,
+    #[serde(default, deserialize_with = "jsonl::non_empty_string")]
+    session_id: Option<String>,
+    #[serde(default, deserialize_with = "jsonl::non_empty_string")]
+    model: Option<String>,
+    #[serde(default, deserialize_with = "jsonl::non_empty_string")]
+    id: Option<String>,
+    #[serde(default, deserialize_with = "lenient_str")]
+    timestamp: Option<String>,
+    #[serde(default, deserialize_with = "lenient_str")]
+    created_at: Option<String>,
+    #[serde(default, deserialize_with = "lenient_str")]
+    #[serde(rename = "startTime")]
+    start_time: Option<String>,
+    #[serde(default, deserialize_with = "lenient_str")]
+    #[serde(rename = "lastUpdated")]
+    last_updated: Option<String>,
+    messages: Option<Value>,
+    tokens: Option<Value>,
+    stats: Option<Value>,
+    result: Option<Value>,
+}
+
+/// Deserialize a JSON value into an optional, untrimmed [`String`] with the same
+/// rules as [`serde_json::Value::as_str`]: JSON strings are returned verbatim,
+/// while numbers, nulls, and other types become `None` instead of failing the
+/// line. Used for fields that the original code navigated with raw
+/// `Value::as_str`: the `type` discriminator (compared exactly against
+/// `"gemini"`, so it must not be trimmed) and the timestamp fields fed to
+/// [`crate::parse_ts_timestamp`], whose strict length checks must see the raw,
+/// untrimmed text.
+fn lenient_str<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value
+        .as_ref()
+        .and_then(Value::as_str)
+        .map(ToString::to_string))
+}
+
+impl GeminiRecord {
+    /// Resolve the session id, preferring `sessionId` then `session_id`,
+    /// matching the original `string_at(record, "sessionId").or_else(...)`.
+    fn session_id(&self) -> Option<String> {
+        self.session_id_camel
+            .clone()
+            .or_else(|| self.session_id.clone())
+    }
+
+    /// Resolve the `stats` value, preferring the top-level `stats` then the
+    /// nested `result.stats`, matching the original lookup order.
+    fn stats(&self) -> Option<&Value> {
+        self.stats
+            .as_ref()
+            .or_else(|| self.result.as_ref().and_then(|result| result.get("stats")))
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 struct GeminiTokens {
@@ -39,24 +115,27 @@ pub(super) struct GeminiUsageEvent {
 pub(super) fn parse_json_file(path: &Path) -> Result<Vec<GeminiUsageEvent>> {
     let fallback_timestamp = file_modified_timestamp(path);
     let content = fs::read_to_string(path)?;
-    let Ok(value) = serde_json::from_str::<Value>(&content) else {
+    let Ok(record) = serde_json::from_str::<GeminiRecord>(&content) else {
         return Ok(Vec::new());
     };
-    let Some(record) = value.as_object() else {
-        return Ok(Vec::new());
-    };
-    let session_id = string_at(record, "sessionId")
-        .or_else(|| string_at(record, "session_id"))
-        .unwrap_or_else(|| {
-            path.file_stem()
-                .and_then(|stem| stem.to_str())
-                .unwrap_or("unknown")
-                .to_string()
-        });
-    let session_timestamp = timestamp_at(record, "startTime")
-        .or_else(|| timestamp_at(record, "lastUpdated"))
+    let session_id = record.session_id().unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("unknown")
+            .to_string()
+    });
+    let session_timestamp = record
+        .start_time
+        .as_deref()
+        .and_then(crate::parse_ts_timestamp)
+        .or_else(|| {
+            record
+                .last_updated
+                .as_deref()
+                .and_then(crate::parse_ts_timestamp)
+        })
         .unwrap_or(fallback_timestamp);
-    if let Some(messages) = record.get("messages").and_then(Value::as_array) {
+    if let Some(messages) = record.messages.as_ref().and_then(Value::as_array) {
         return Ok(messages
             .iter()
             .filter_map(Value::as_object)
@@ -64,21 +143,22 @@ pub(super) fn parse_json_file(path: &Path) -> Result<Vec<GeminiUsageEvent>> {
             .filter_map(|message| parse_direct_event(message, None, &session_id, session_timestamp))
             .collect());
     }
-    if record.get("type").and_then(Value::as_str) == Some("gemini") {
+    if record.r#type.as_deref() == Some("gemini") {
         return Ok(
-            parse_direct_event(record, None, &session_id, fallback_timestamp)
+            parse_direct_event_record(&record, None, &session_id, fallback_timestamp)
                 .into_iter()
                 .collect(),
         );
     }
-    let stats = record
-        .get("stats")
-        .or_else(|| record.get("result").and_then(|result| result.get("stats")));
     Ok(parse_stats_events(
-        stats,
-        string_at(record, "model").as_deref(),
+        record.stats(),
+        record.model.as_deref(),
         &session_id,
-        timestamp_at(record, "timestamp").unwrap_or(fallback_timestamp),
+        record
+            .timestamp
+            .as_deref()
+            .and_then(crate::parse_ts_timestamp)
+            .unwrap_or(fallback_timestamp),
     ))
 }
 
@@ -92,32 +172,24 @@ pub(super) fn parse_jsonl_file(path: &Path) -> Result<Vec<GeminiUsageEvent>> {
     let mut current_model = None::<String>;
     let mut events = Vec::new();
     let mut direct_event_indexes = HashMap::<String, usize>::new();
-    let content = fs::read_to_string(path)?;
-    for line in content.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let Some(record) = value.as_object() else {
-            continue;
-        };
-        if let Some(value) =
-            string_at(record, "sessionId").or_else(|| string_at(record, "session_id"))
-        {
+    let content = fs::read(path)?;
+    for record in jsonl::records::<GeminiRecord>(&content, None) {
+        if let Some(value) = record.session_id() {
             session_id = value;
         }
-        if let Some(model) = string_at(record, "model") {
+        if let Some(model) = record.model.clone() {
             current_model = Some(model);
         }
-        if record.get("type").and_then(Value::as_str) == Some("gemini") {
-            let Some(event) = parse_direct_event(
-                record,
+        if record.r#type.as_deref() == Some("gemini") {
+            let Some(event) = parse_direct_event_record(
+                &record,
                 current_model.as_deref(),
                 &session_id,
                 fallback_timestamp,
             ) else {
                 continue;
             };
-            if let Some(id) = string_at(record, "id") {
+            if let Some(id) = record.id.clone() {
                 if let Some(index) = direct_event_indexes.get(&id).copied() {
                     events[index] = event;
                 } else {
@@ -129,15 +201,17 @@ pub(super) fn parse_jsonl_file(path: &Path) -> Result<Vec<GeminiUsageEvent>> {
             }
             continue;
         }
-        let stats = record
-            .get("stats")
-            .or_else(|| record.get("result").and_then(|result| result.get("stats")));
+        let stats = record.stats();
         if stats.is_some() {
             events.extend(parse_stats_events(
                 stats,
                 current_model.as_deref(),
                 &session_id,
-                timestamp_at(record, "timestamp").unwrap_or(fallback_timestamp),
+                record
+                    .timestamp
+                    .as_deref()
+                    .and_then(crate::parse_ts_timestamp)
+                    .unwrap_or(fallback_timestamp),
             ));
         }
     }
@@ -160,6 +234,37 @@ fn parse_direct_event(
         tokens,
         normalize_session_input,
         string_at(record, "id"),
+    )
+}
+
+/// Build a direct Gemini usage event from a typed [`GeminiRecord`].
+///
+/// Mirrors [`parse_direct_event`] for the top-level-record code paths where the
+/// envelope is already deserialized into a struct.
+fn parse_direct_event_record(
+    record: &GeminiRecord,
+    model_hint: Option<&str>,
+    session_id: &str,
+    fallback_timestamp: TimestampMs,
+) -> Option<GeminiUsageEvent> {
+    let tokens = parse_tokens(record.tokens.as_ref())?;
+    build_event(
+        record.model.as_deref().or(model_hint),
+        session_id,
+        record
+            .timestamp
+            .as_deref()
+            .and_then(crate::parse_ts_timestamp)
+            .or_else(|| {
+                record
+                    .created_at
+                    .as_deref()
+                    .and_then(crate::parse_ts_timestamp)
+            })
+            .unwrap_or(fallback_timestamp),
+        tokens,
+        normalize_session_input,
+        record.id.clone(),
     )
 }
 
@@ -227,6 +332,7 @@ fn build_event(
         cache_creation_input_tokens: 0,
         cache_read_input_tokens: cache_read_tokens,
         speed: None,
+        cache_creation: None,
     };
     let (display_usage, extra_total_tokens) =
         apply_total_token_fallback(display_usage, tokens.thoughts, total_tokens);
@@ -344,15 +450,18 @@ pub(super) fn event_to_loaded(
         cache_creation_input_tokens: 0,
         cache_read_input_tokens: event.cache_read_tokens,
         speed: None,
+        cache_creation: None,
     };
     let cost_usage = TokenUsageRaw {
         output_tokens: event.output_tokens + event.reasoning_tokens,
+        cache_creation: None,
         ..usage
     };
     let extra_total_tokens = event
         .total_tokens
         .saturating_sub(event.input_tokens + event.output_tokens + event.cache_read_tokens);
     let cost = calculate_gemini_cost(&event.model, cost_usage, mode, pricing);
+    let missing_pricing_model = missing_gemini_pricing(&event.model, cost_usage, mode, pricing);
     let data = UsageEntry {
         session_id: Some(event.session_id.clone()),
         timestamp: event.timestamp_text,
@@ -365,6 +474,7 @@ pub(super) fn event_to_loaded(
         cost_usd: None,
         request_id: None,
         is_api_error_message: None,
+        is_sidechain: None,
     };
     LoadedEntry {
         date: format_date_tz(event.timestamp, tz),
@@ -378,6 +488,7 @@ pub(super) fn event_to_loaded(
         message_count: None,
         model: Some(event.model),
         usage_limit_reset_time: None,
+        missing_pricing_model,
         data,
     }
 }
@@ -405,6 +516,23 @@ fn calculate_gemini_cost(
             0.0
         }
     }
+}
+
+fn missing_gemini_pricing(
+    model: &str,
+    usage: TokenUsageRaw,
+    mode: CostMode,
+    pricing: &PricingMap,
+) -> Option<String> {
+    if mode == CostMode::Display {
+        return None;
+    }
+    missing_pricing_model_for_candidates(
+        model,
+        model_candidates(model),
+        crate::total_usage_tokens(usage),
+        Some(pricing),
+    )
 }
 
 fn model_candidates(model: &str) -> Vec<String> {
@@ -441,5 +569,26 @@ mod tests {
 
         assert_eq!(event.output_tokens, 654);
         assert_eq!(event.reasoning_tokens, 0);
+    }
+
+    #[test]
+    fn type_discriminator_is_untrimmed_and_tolerates_non_strings() {
+        // Exact match still works.
+        let exact = serde_json::from_str::<GeminiRecord>(r#"{"type":"gemini"}"#).unwrap();
+        assert_eq!(exact.r#type.as_deref(), Some("gemini"));
+
+        // Surrounding whitespace must NOT be trimmed, so a padded value does not
+        // spuriously match the "gemini" discriminator. This mirrors the original
+        // raw `Value::as_str` comparison rather than the trimming
+        // `non_empty_string` helper.
+        let padded = serde_json::from_str::<GeminiRecord>(r#"{"type":" gemini "}"#).unwrap();
+        assert_eq!(padded.r#type.as_deref(), Some(" gemini "));
+        assert_ne!(padded.r#type.as_deref(), Some("gemini"));
+
+        // A non-string type becomes None without failing the line, so the record
+        // still falls through to stats parsing.
+        let numeric = serde_json::from_str::<GeminiRecord>(r#"{"type":5,"stats":{}}"#).unwrap();
+        assert_eq!(numeric.r#type, None);
+        assert!(numeric.stats.is_some());
     }
 }

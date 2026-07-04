@@ -1,12 +1,9 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{fs, path::Path};
 
-use crate::{cli::SharedArgs, parse_tz, LoadedEntry, PricingMap, Result, TimestampMs};
+use crate::{LoadedEntry, PricingMap, Result, TimestampMs, cli::SharedArgs, parse_tz};
 
 use super::{
-    parser::{estimate_usage_events, parse_step_payload, usage_event_to_loaded, AntigravityStep},
+    parser::{AntigravityStep, estimate_usage_events, parse_step_payload, usage_event_to_loaded},
     paths::discover_conversation_dbs,
 };
 
@@ -108,8 +105,4 @@ fn file_modified_timestamp(path: &Path) -> TimestampMs {
         .and_then(|duration| i64::try_from(duration.as_millis()).ok())
         .map(TimestampMs::from_millis)
         .unwrap_or(TimestampMs::UNIX_EPOCH)
-}
-
-pub(crate) fn source_files() -> Result<Vec<PathBuf>> {
-    discover_conversation_dbs()
 }

@@ -1,15 +1,14 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::{
+    Align, CodexGroup, CodexModelUsage, Color, PricingMap, Result, SimpleTable,
     cli::{AgentReportKind, CodexSpeed, SharedArgs},
-    color, format_currency, format_models_multiline, format_number, json_float, print_box_title,
-    Align, CodexGroup, CodexModelUsage, CodexTokenUsageEvent, Color, PricingMap, Result,
-    SimpleTable, TimestampMs,
+    color, format_currency, format_models_multiline, format_number, json_float,
+    missing_pricing_model_for_token_total, print_box_title,
+    print_missing_pricing_warnings_for_models,
 };
-
-use super::speed::resolve_codex_speed_for_timestamp;
 
 pub(super) fn report_from_groups(
     groups: &BTreeMap<String, CodexGroup>,
@@ -63,7 +62,8 @@ fn group_json(
     let mut row = json!({
         period_key(kind): period,
         "inputTokens": input_tokens,
-        "cachedInputTokens": group.cached_input_tokens,
+        "cacheCreationTokens": 0,
+        "cacheReadTokens": group.cached_input_tokens,
         "outputTokens": group.output_tokens,
         "reasoningOutputTokens": group.reasoning_output_tokens,
         "totalTokens": group.total_tokens,
@@ -86,7 +86,8 @@ pub(crate) fn non_cached_input_tokens(input_tokens: u64, cached_input_tokens: u6
 fn model_usage_json(usage: &CodexModelUsage) -> Value {
     json!({
         "inputTokens": non_cached_input_tokens(usage.input_tokens, usage.cached_input_tokens),
-        "cachedInputTokens": usage.cached_input_tokens,
+        "cacheCreationTokens": 0,
+        "cacheReadTokens": usage.cached_input_tokens,
         "outputTokens": usage.output_tokens,
         "reasoningOutputTokens": usage.reasoning_output_tokens,
         "totalTokens": usage.total_tokens,
@@ -115,7 +116,8 @@ fn totals_json<'a>(
     }
     json!({
         "inputTokens": input,
-        "cachedInputTokens": cached,
+        "cacheCreationTokens": 0,
+        "cacheReadTokens": cached,
         "outputTokens": output,
         "reasoningOutputTokens": reasoning,
         "totalTokens": total,
@@ -129,42 +131,6 @@ pub(crate) fn calculate_codex_model_cost(
     pricing: &PricingMap,
     speed: CodexSpeed,
 ) -> f64 {
-    calculate_codex_model_usage_cost(model, usage, pricing, speed)
-}
-
-pub(super) fn calculate_codex_event_cost(
-    model: &str,
-    event: &CodexTokenUsageEvent,
-    timestamp: TimestampMs,
-    pricing: &PricingMap,
-    speed: CodexSpeed,
-) -> f64 {
-    let usage = CodexModelUsage {
-        input_tokens: event.input_tokens,
-        cached_input_tokens: event.cached_input_tokens,
-        output_tokens: event.output_tokens,
-        reasoning_output_tokens: event.reasoning_output_tokens,
-        total_tokens: event.total_tokens,
-        cost: None,
-        is_fallback: event.is_fallback_model,
-    };
-    calculate_codex_model_usage_cost(
-        model,
-        &usage,
-        pricing,
-        resolve_codex_speed_for_timestamp(speed, timestamp),
-    )
-}
-
-fn calculate_codex_model_usage_cost(
-    model: &str,
-    usage: &CodexModelUsage,
-    pricing: &PricingMap,
-    speed: CodexSpeed,
-) -> f64 {
-    if let Some(cost) = usage.cost {
-        return cost;
-    }
     let Some(pricing) = pricing.find(model) else {
         return 0.0;
     };
@@ -194,14 +160,41 @@ pub(crate) fn calculate_group_cost(
     pricing: &PricingMap,
     speed: CodexSpeed,
 ) -> f64 {
-    if let Some(cost) = group.cost {
-        return cost;
-    }
     group
         .models
         .iter()
-        .map(|(model, usage)| calculate_codex_model_usage_cost(model, usage, pricing, speed))
+        .map(|(model, usage)| calculate_codex_model_cost(model, usage, pricing, speed))
         .sum()
+}
+
+pub(crate) fn codex_model_missing_pricing(
+    model: &str,
+    usage: &CodexModelUsage,
+    pricing: &PricingMap,
+) -> bool {
+    missing_pricing_model_for_token_total(
+        Some(model),
+        usage
+            .total_tokens
+            .max(usage.input_tokens.saturating_add(usage.output_tokens)),
+        Some(pricing),
+    )
+    .is_some()
+}
+
+pub(crate) fn codex_missing_pricing_models(
+    groups: &BTreeMap<String, CodexGroup>,
+    pricing: &PricingMap,
+) -> Vec<String> {
+    let mut models = BTreeSet::new();
+    for group in groups.values() {
+        for (model, usage) in &group.models {
+            if codex_model_missing_pricing(model, usage, pricing) {
+                models.insert(model.clone());
+            }
+        }
+    }
+    models.into_iter().collect()
 }
 
 pub(super) fn print_table_from_groups(
@@ -233,31 +226,33 @@ pub(super) fn print_table_from_groups(
         ),
         shared,
     );
-    let mut table = SimpleTable::new(
-        vec![
-            first_column,
-            "Models",
-            "Input",
-            "Output",
-            "Reasoning",
-            "Cache Read",
-            "Total Tokens",
-            "Cost (USD)",
-        ],
-        vec![
-            Align::Left,
-            Align::Left,
-            Align::Right,
-            Align::Right,
-            Align::Right,
-            Align::Right,
-            Align::Right,
-            Align::Right,
-        ],
-        shared,
-    )
-    .with_terminal_width(crate::terminal_width())
-    .with_date_compaction(true);
+    let mut headers = vec![
+        first_column,
+        "Models",
+        "Input",
+        "Output",
+        "Reasoning",
+        "Cache Read",
+        "Total Tokens",
+        "Cost (USD)",
+    ];
+    let mut aligns = vec![
+        Align::Left,
+        Align::Left,
+        Align::Right,
+        Align::Right,
+        Align::Right,
+        Align::Right,
+        Align::Right,
+        Align::Right,
+    ];
+    if shared.no_cost {
+        headers.pop();
+        aligns.pop();
+    }
+    let mut table = SimpleTable::new(headers, aligns, crate::terminal_style(shared))
+        .with_terminal_width(crate::terminal_width())
+        .with_date_compaction(true);
     let mut total_input = 0;
     let mut total_cached = 0;
     let mut total_output = 0;
@@ -274,7 +269,7 @@ pub(super) fn print_table_from_groups(
         total_tokens += group.total_tokens;
         total_cost += cost;
         let models = format_models_multiline(&group.models.keys().cloned().collect::<Vec<_>>());
-        table.push(vec![
+        let mut row = vec![
             label.clone(),
             models,
             format_number(input_tokens),
@@ -283,10 +278,14 @@ pub(super) fn print_table_from_groups(
             format_number(group.cached_input_tokens),
             format_number(group.total_tokens),
             format_currency(cost),
-        ]);
+        ];
+        if shared.no_cost {
+            row.pop();
+        }
+        table.push(row);
     }
     table.separator();
-    table.push(vec![
+    let mut total_row = vec![
         color(shared, "Total", Color::Yellow),
         String::new(),
         color(shared, format_number(total_input), Color::Yellow),
@@ -295,7 +294,16 @@ pub(super) fn print_table_from_groups(
         color(shared, format_number(total_cached), Color::Yellow),
         color(shared, format_number(total_tokens), Color::Yellow),
         color(shared, format_currency(total_cost), Color::Yellow),
-    ]);
+    ];
+    if shared.no_cost {
+        total_row.pop();
+    }
+    table.push(total_row);
     table.print()?;
+    let missing_models = codex_missing_pricing_models(groups, pricing);
+    print_missing_pricing_warnings_for_models(
+        missing_models.iter().map(String::as_str),
+        shared.offline,
+    );
     Ok(())
 }

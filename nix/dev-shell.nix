@@ -20,12 +20,15 @@ in
       devShells.default = pkgs.mkShell {
         buildInputs =
           (with pkgs; [
-            pnpm_11
-            bun
+            nodejs
+            pnpm
+            nushell
+            config.packages.publint
 
             rustToolchain
             cargo-edit
             cargo-insta
+            cargo-llvm-cov
             pkg-config
             openssl
             config.treefmt.build.wrapper
@@ -35,11 +38,13 @@ in
             typos
             typos-lsp
             oxfmt
+            actionlint
+            zizmor
             oxlint
+            just
             prek
             gitleaks
             renovate
-            typescript-go
             jq
             git
             gh
@@ -52,16 +57,20 @@ in
             delta
             dust
           ])
+          ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+            pkgs.mold
+          ]
           ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
             pkgs.apple-sdk_15
           ]
           ++ config.pre-commit.settings.enabledPackages;
 
         shellHook = ''
-          # Install dependencies only if node_modules/.pnpm/lock.yaml is older than pnpm-lock.yaml
-          if [ ! -f node_modules/.pnpm/lock.yaml ] || [ pnpm-lock.yaml -nt node_modules/.pnpm/lock.yaml ]; then
-            echo "📦 Installing dependencies..."
-            pnpm install --frozen-lockfile
+          if [ "$(uname -s)" = "Linux" ]; then
+            case " ''${RUSTFLAGS:-} " in
+              *" -C link-arg=-fuse-ld=mold "*) ;;
+              *) export RUSTFLAGS="''${RUSTFLAGS:+$RUSTFLAGS }-C link-arg=-fuse-ld=mold" ;;
+            esac
           fi
           ${lib.getExe config.packages.syncAgentSkills}
           ${config.pre-commit.shellHook}

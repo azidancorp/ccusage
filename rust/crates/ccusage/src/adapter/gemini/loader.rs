@@ -1,4 +1,6 @@
-use crate::{cli::SharedArgs, parse_tz, LoadedEntry, PricingMap, Result};
+use crate::{
+    LoadedEntry, PricingMap, Result, cli::SharedArgs, debug_log, parse_tz, read_files_parallel,
+};
 
 use super::{
     parser::{event_to_loaded, parse_json_file, parse_jsonl_file},
@@ -13,14 +15,24 @@ pub(crate) fn load_entries(shared: &SharedArgs, pricing: &PricingMap) -> Result<
 
 fn load_entries_inner(shared: &SharedArgs, pricing: &PricingMap) -> Result<Vec<LoadedEntry>> {
     let tz = parse_tz(shared.timezone.as_deref());
-    let mut events = Vec::new();
-    for file in discover_log_files()? {
-        if file.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
-            events.extend(parse_jsonl_file(&file)?);
+    let files = discover_log_files()?;
+    // Read each log file in parallel; the events keep their original file order
+    // before the stable sort, so output is identical to the sequential read.
+    let loaded = read_files_parallel(&files, shared.single_thread, |file| {
+        let parsed = if file.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
+            parse_jsonl_file(file)
         } else {
-            events.extend(parse_json_file(&file)?);
-        }
-    }
+            parse_json_file(file)
+        };
+        parsed.unwrap_or_else(|error| {
+            debug_log(
+                shared,
+                format!("Failed to read Gemini log file {}: {error}", file.display()),
+            );
+            Vec::new()
+        })
+    });
+    let mut events: Vec<_> = loaded.into_iter().flatten().collect();
     events.sort_by_key(|event| event.timestamp);
     Ok(events
         .into_iter()
@@ -30,42 +42,24 @@ fn load_entries_inner(shared: &SharedArgs, pricing: &PricingMap) -> Result<Vec<L
 
 #[cfg(test)]
 mod tests {
-    use std::{env, fs, path::PathBuf};
-
     use super::*;
-
-    fn temp_gemini_dir(name: &str) -> PathBuf {
-        let mut path = env::temp_dir();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        path.push(format!("ccusage-gemini-{name}-{nanos}"));
-        path
-    }
+    use ccusage_test_support::fs_fixture;
 
     #[test]
     fn loads_jsonl_token_events_and_separates_cached_input() {
-        let _guard = super::super::GEMINI_DATA_DIR_LOCK.lock().unwrap();
-        let gemini_dir = temp_gemini_dir("jsonl");
-        fs::create_dir_all(gemini_dir.join("project/chats")).unwrap();
-        fs::write(
-            gemini_dir.join("project/chats/session-a.jsonl"),
-            [
+        let fixture = fs_fixture!({
+            "project/chats/session-a.jsonl": [
                 r#"{"sessionId":"session-a","projectHash":"project-a","startTime":"2026-05-17T11:07:00.000Z"}"#,
                 r#"{"id":"msg-a","timestamp":"2026-05-17T11:07:32.000Z","type":"gemini","model":"gemini-3-flash-preview","tokens":{"input":15327,"output":23,"cached":11526,"thoughts":919,"tool":7,"total":16276}}"#,
             ]
             .join("\n"),
-        )
-        .unwrap();
-        env::set_var(super::super::paths::GEMINI_DATA_DIR_ENV, &gemini_dir);
+        });
+        let _env_guard = super::super::GeminiDataDirEnvGuard::set(fixture.root());
         let shared = SharedArgs {
             timezone: Some("UTC".to_string()),
             ..SharedArgs::default()
         };
         let entries = load_entries(&shared, &PricingMap::load_embedded()).unwrap();
-        env::remove_var(super::super::paths::GEMINI_DATA_DIR_ENV);
-        fs::remove_dir_all(&gemini_dir).unwrap();
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].date, "2026-05-17");

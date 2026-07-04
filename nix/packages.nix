@@ -27,6 +27,13 @@ in
           ;
       };
       ccusageProgram = pkgs.lib.getExe' ccusage "ccusage";
+      # Regeneration-only output for committed models.dev snapshots;
+      # `just gen-models-dev-pricing` builds this and copies them into the source
+      # tree. It is not part of the ccusage build, which embeds the committed files.
+      models-dev-pricing = pkgs.callPackage ../nix/models-dev-pricing.nix {
+        modelsDevSrc = inputs.models-dev;
+      };
+      publint = pkgs.callPackage ../nix/publint.nix { };
     in
     {
       apps = {
@@ -42,7 +49,7 @@ in
 
       packages = {
         default = ccusage;
-        inherit ccusage;
+        inherit ccusage models-dev-pricing publint;
       };
     };
 }

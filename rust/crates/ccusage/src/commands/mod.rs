@@ -11,7 +11,9 @@ use serde_json::json;
 
 use crate::pricing::PricingMap;
 use crate::{
-    block_json, calculate_burn_rate,
+    BucketKind, Color, Context, DEFAULT_RECENT_DAYS, DEFAULT_SESSION_DURATION_HOURS,
+    MILLIS_PER_DAY, MILLIS_PER_MINUTE, Result, SessionAccumulator, TimestampMs, block_json,
+    calculate_burn_rate,
     cli::{
         BlocksArgs, CostSource, DailyArgs, SessionArgs, SharedArgs, SortOrder, StatuslineArgs,
         VisualBurnRate, WeekDay, WeeklyArgs,
@@ -23,8 +25,7 @@ use crate::{
     load_daily_summaries, load_entries, print_active_block_detail, print_blocks_table,
     print_json_or_jq, print_usage_table, session_summary_json, sort_blocks, sort_summaries,
     summarize_by_key, summarize_summaries_by_bucket, summary_json, total_usage_tokens, totals_json,
-    utc_now, wants_json, BucketKind, Color, Context, Result, SessionAccumulator, TimestampMs,
-    DEFAULT_RECENT_DAYS, DEFAULT_SESSION_DURATION_HOURS, MILLIS_PER_DAY, MILLIS_PER_MINUTE,
+    utc_now, wants_json,
 };
 
 pub(crate) fn run_daily(args: DailyArgs) -> Result<()> {
@@ -44,13 +45,13 @@ pub(crate) fn run_daily(args: DailyArgs) -> Result<()> {
                 "projects": group_project_output(&rows),
                 "totals": totals_json(&rows),
             });
-            print_json_or_jq(output, shared.jq.as_deref())?;
+            print_json_or_jq(output, shared.jq.as_deref(), shared.no_cost)?;
         } else {
             let output = json!({
                 "daily": rows.iter().map(summary_json).collect::<Vec<_>>(),
                 "totals": totals_json(&rows),
             });
-            print_json_or_jq(output, shared.jq.as_deref())?;
+            print_json_or_jq(output, shared.jq.as_deref(), shared.no_cost)?;
         }
         return Ok(());
     }
@@ -92,7 +93,7 @@ pub(crate) fn run_bucket(shared: SharedArgs, kind: BucketKind) -> Result<()> {
             key: buckets.iter().map(summary_json).collect::<Vec<_>>(),
             "totals": totals_json(&buckets),
         });
-        print_json_or_jq(output, shared.jq.as_deref())?;
+        print_json_or_jq(output, shared.jq.as_deref(), shared.no_cost)?;
         return Ok(());
     }
 
@@ -125,7 +126,7 @@ pub(crate) fn run_weekly(args: WeeklyArgs) -> Result<()> {
             "weekly": weekly.iter().map(summary_json).collect::<Vec<_>>(),
             "totals": totals_json(&weekly),
         });
-        print_json_or_jq(output, shared.jq.as_deref())?;
+        print_json_or_jq(output, shared.jq.as_deref(), shared.no_cost)?;
         return Ok(());
     }
 
@@ -166,7 +167,7 @@ pub(crate) fn run_session(args: SessionArgs) -> Result<()> {
 
     let mut rows = Vec::with_capacity(grouped.len());
     for group in grouped {
-        rows.push(group.into_summary(session_shared.timezone.as_deref())?);
+        rows.push(group.into_summary()?);
     }
     if session_shared.since.is_some() || session_shared.until.is_some() {
         rows.retain(|row| {
@@ -198,7 +199,7 @@ pub(crate) fn run_session(args: SessionArgs) -> Result<()> {
             "sessions": rows.iter().map(session_summary_json).collect::<Vec<_>>(),
             "totals": totals_json(&rows),
         });
-        print_json_or_jq(output, session_shared.jq.as_deref())?;
+        print_json_or_jq(output, session_shared.jq.as_deref(), session_shared.no_cost)?;
         return Ok(());
     }
 
@@ -253,12 +254,14 @@ fn run_session_id(id: &str, shared: &SharedArgs) -> Result<()> {
                 "costUSD": entry.data.cost_usd.unwrap_or(0.0),
             })).collect::<Vec<_>>(),
         });
-        print_json_or_jq(output, shared.jq.as_deref())?;
+        print_json_or_jq(output, shared.jq.as_deref(), shared.no_cost)?;
         return Ok(());
     }
 
     println!("Claude Code Session Usage - {id}");
-    println!("Total Cost: {}", format_currency(total_cost));
+    if !shared.no_cost {
+        println!("Total Cost: {}", format_currency(total_cost));
+    }
     println!("Total Tokens: {}", format_number(total_tokens));
     println!("Total Entries: {}", session_entries.len());
     Ok(())
@@ -296,7 +299,7 @@ pub(crate) fn run_blocks(args: BlocksArgs) -> Result<()> {
         let output = json!({
             "blocks": blocks.iter().map(|block| block_json(block, args.token_limit.as_deref(), max_tokens)).collect::<Vec<_>>(),
         });
-        print_json_or_jq(output, shared.jq.as_deref())?;
+        print_json_or_jq(output, shared.jq.as_deref(), shared.no_cost)?;
         return Ok(());
     }
 
@@ -342,13 +345,12 @@ pub(crate) fn run_statusline(args: StatuslineArgs) -> Result<()> {
         None
     };
 
-    if let Some(cache) = initial_cache.as_ref() {
-        if let Some(output) =
+    if let Some(cache) = initial_cache.as_ref()
+        && let Some(output) =
             cached_statusline_output(cache, current_mtime, now_millis(), args.refresh_interval)
-        {
-            println!("{output}");
-            return Ok(());
-        }
+    {
+        println!("{output}");
+        return Ok(());
     }
 
     if cache_enabled {
@@ -382,6 +384,22 @@ pub(crate) fn run_statusline(args: StatuslineArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Resolve the model label shown in the statusline.
+///
+/// Looks up the model's `display_name` in the user-configured alias map and
+/// returns the matching short label when present. Long identifiers such as AWS
+/// Bedrock inference profile ARNs can therefore be displayed as a concise name.
+/// Falls back to the original `display_name` when no alias matches.
+fn resolve_model_label<'a>(
+    aliases: &'a std::collections::HashMap<String, String>,
+    display_name: &'a str,
+) -> &'a str {
+    aliases
+        .get(display_name)
+        .map(String::as_str)
+        .unwrap_or(display_name)
 }
 
 fn render_statusline(
@@ -475,6 +493,7 @@ fn render_statusline(
                 Path::new(&hook.transcript_path),
                 hook.model.id.as_deref(),
                 shared.offline,
+                shared,
             )
             .map(|context| (context.total_input_tokens, context.context_window_size))
         })
@@ -498,9 +517,11 @@ fn render_statusline(
             .unwrap_or_else(|| "N/A".to_string())
     };
 
+    let model_label = resolve_model_label(&args.model_label_aliases, &hook.model.display_name);
+
     Ok(format!(
         "🤖 {} | 💰 {} session / {} today / {}{} | 🧠 {}",
-        hook.model.display_name,
+        model_label,
         session_display,
         format_currency(today_cost),
         block_info,
@@ -519,6 +540,7 @@ fn statusline_today_shared(
         since: Some(today.clone()),
         until: Some(today),
         offline: shared.offline,
+        pricing_overrides: shared.pricing_overrides.clone(),
         timezone: args.timezone.clone(),
         ..SharedArgs::default()
     }
@@ -568,8 +590,10 @@ fn calculate_context_tokens_from_transcript(
     path: &Path,
     model_id: Option<&str>,
     offline: bool,
+    shared: &SharedArgs,
 ) -> Option<HookContext> {
     let content = fs::read_to_string(path).ok()?;
+    let mut pricing: Option<PricingMap> = None;
     for line in content.lines().rev() {
         let line = line.trim();
         if line.is_empty() {
@@ -603,7 +627,17 @@ fn calculate_context_tokens_from_transcript(
             .unwrap_or_default();
         let context_window_size = model_id
             .filter(|model_id| !model_id.is_empty())
-            .and_then(|model_id| PricingMap::load(offline, false).context_limit(model_id))
+            .and_then(|model_id| {
+                pricing
+                    .get_or_insert_with(|| {
+                        PricingMap::load_with_overrides(
+                            offline,
+                            false,
+                            shared.pricing_overrides.iter(),
+                        )
+                    })
+                    .context_limit(model_id)
+            })
             .unwrap_or(200_000);
         return Some(HookContext {
             total_input_tokens: input_tokens + cache_creation + cache_read,
@@ -788,34 +822,28 @@ struct HookContext {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, fs, time::SystemTime};
+    use ccusage_test_support::fs_fixture;
 
     use super::*;
 
-    fn temp_statusline_path(name: &str) -> std::path::PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        env::temp_dir().join(format!("ccusage-statusline-{name}-{nanos}.jsonl"))
-    }
-
     #[test]
     fn calculates_context_tokens_from_latest_assistant_transcript_line() {
-        let path = temp_statusline_path("context");
-        fs::write(
-            &path,
-            [
+        let fixture = fs_fixture!({
+            "transcript.jsonl": [
                 r#"{"type":"assistant","message":{"usage":{"input_tokens":1000,"output_tokens":999}}}"#,
                 r#"not json"#,
                 r#"{"type":"assistant","message":{"usage":{"input_tokens":2000,"cache_creation_input_tokens":100,"cache_read_input_tokens":50,"output_tokens":888}}}"#,
             ]
             .join("\n"),
+        });
+
+        let context = calculate_context_tokens_from_transcript(
+            &fixture.path("transcript.jsonl"),
+            None,
+            true,
+            &SharedArgs::default(),
         )
         .unwrap();
-
-        let context = calculate_context_tokens_from_transcript(&path, None, true).unwrap();
-        fs::remove_file(&path).unwrap();
 
         assert_eq!(context.total_input_tokens, 2150);
         assert_eq!(context.context_window_size, 200_000);
@@ -823,23 +851,29 @@ mod tests {
 
     #[test]
     fn uses_model_context_limit_for_transcript_context_tokens() {
-        let path = temp_statusline_path("context-limit");
-        fs::write(
-            &path,
-            r#"{"type":"assistant","message":{"usage":{"input_tokens":1000}}}"#,
-        )
-        .unwrap();
+        let fixture = fs_fixture!({
+            "transcript.jsonl": r#"{"type":"assistant","message":{"usage":{"input_tokens":1000}}}"#,
+        });
+
+        let mut shared = SharedArgs::default();
+        shared.pricing_overrides.insert(
+            "test-model-context-limit".to_string(),
+            ccusage_cli::PricingOverride {
+                max_input_tokens: Some(1_500_000),
+                ..Default::default()
+            },
+        );
 
         let context = calculate_context_tokens_from_transcript(
-            &path,
-            Some("anthropic.claude-3-5-sonnet-20240620-v1:0"),
+            &fixture.path("transcript.jsonl"),
+            Some("test-model-context-limit"),
             true,
+            &shared,
         )
         .unwrap();
-        fs::remove_file(&path).unwrap();
 
         assert_eq!(context.total_input_tokens, 1000);
-        assert_eq!(context.context_window_size, 1_000_000);
+        assert_eq!(context.context_window_size, 1_500_000);
     }
 
     #[test]
@@ -860,10 +894,17 @@ mod tests {
             timezone: Some("Asia/Tokyo".to_string()),
             ..StatuslineArgs::default()
         };
-        let shared = SharedArgs {
+        let mut shared = SharedArgs {
             offline: true,
             ..SharedArgs::default()
         };
+        shared.pricing_overrides.insert(
+            "statusline-model".to_string(),
+            ccusage_cli::PricingOverride {
+                input_cost_per_token: Some(1e-6),
+                ..Default::default()
+            },
+        );
         let now = TimestampMs::from_millis(1_779_380_820_000);
 
         let today_shared = statusline_today_shared(&args, &shared, now);
@@ -871,6 +912,11 @@ mod tests {
         assert_eq!(today_shared.since.as_deref(), Some("20260522"));
         assert_eq!(today_shared.until.as_deref(), Some("20260522"));
         assert_eq!(today_shared.timezone.as_deref(), Some("Asia/Tokyo"));
+        assert!(
+            today_shared
+                .pricing_overrides
+                .contains_key("statusline-model")
+        );
     }
 
     #[test]
@@ -922,5 +968,30 @@ mod tests {
             cached_statusline_output(&cache, 456, 20_000, 1),
             Some("stale status")
         );
+    }
+
+    #[test]
+    fn resolves_model_label_from_alias_map() {
+        let mut aliases = std::collections::HashMap::new();
+        aliases.insert(
+            "arn:aws:bedrock:ap-northeast-1:012345678910:application-inference-profile/abcde12345"
+                .to_string(),
+            "claude-opus-4-6".to_string(),
+        );
+
+        assert_eq!(
+            resolve_model_label(
+                &aliases,
+                "arn:aws:bedrock:ap-northeast-1:012345678910:application-inference-profile/abcde12345"
+            ),
+            "claude-opus-4-6"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_display_name_when_no_alias_matches() {
+        let aliases = std::collections::HashMap::new();
+
+        assert_eq!(resolve_model_label(&aliases, "Opus 4.1"), "Opus 4.1");
     }
 }
