@@ -7,7 +7,13 @@ use std::{
 use jiff::tz::TimeZone as JiffTimeZone;
 use serde::Deserialize;
 
-use super::super::jsonl;
+use super::{
+    super::jsonl,
+    paths::{
+        KimiWireContext, MAIN_STREAM_ID, combine_stream_id, root_from_wire_path,
+        wire_context_from_path,
+    },
+};
 use crate::{
     LoadedEntry, PricingMap, Result, TimestampMs, TokenUsageRaw, UsageEntry, UsageMessage,
     apply_total_token_fallback, calculate_cost_for_usage, cli::CostMode, fast::LinePrefilter,
@@ -50,6 +56,13 @@ struct KimiWirePayload {
     token_usage: Option<KimiTokenUsage>,
     #[serde(default, deserialize_with = "jsonl::non_empty_string")]
     message_id: Option<String>,
+    event: Option<Box<KimiWireMessage>>,
+    #[serde(default, deserialize_with = "jsonl::non_empty_string")]
+    task_tool_call_id: Option<String>,
+    #[serde(default, deserialize_with = "jsonl::non_empty_string")]
+    agent_id: Option<String>,
+    #[serde(default, deserialize_with = "jsonl::non_empty_string")]
+    parent_tool_call_id: Option<String>,
 }
 
 /// Token counts reported under `message.payload.token_usage`.
@@ -72,6 +85,7 @@ pub(super) struct KimiUsageEntry {
     timestamp: TimestampMs,
     timestamp_text: String,
     session_id: String,
+    stream_id: String,
     model: String,
     message_id: Option<String>,
     input_tokens: u64,
@@ -83,13 +97,17 @@ pub(super) struct KimiUsageEntry {
 
 pub(super) fn read_wire_file(path: &Path) -> Result<Vec<KimiUsageEntry>> {
     let model = read_model_from_config(path);
+    let context = wire_context_from_path(path).unwrap_or_else(|| KimiWireContext {
+        session_id: extract_session_id_from_parent(path),
+        stream_id: MAIN_STREAM_ID.to_string(),
+    });
     let fallback_timestamp = file_modified_timestamp(path);
     let content = fs::read(path)?;
     // Usable Kimi wire lines are `StatusUpdate` records carrying a
     // `token_usage` payload, so require both substrings before JSON parsing.
     let prefilter = LinePrefilter::all(&[br#""StatusUpdate""#, br#""token_usage""#]);
     Ok(jsonl::records::<KimiWireLine>(&content, Some(&prefilter))
-        .filter_map(|line| wire_line_to_entry(&line, path, &model, fallback_timestamp))
+        .filter_map(|line| wire_line_to_entry(&line, &model, fallback_timestamp, &context))
         .collect::<Vec<_>>())
 }
 
@@ -107,12 +125,7 @@ fn read_model_from_config(file_path: &Path) -> String {
 }
 
 fn kimi_root_from_wire_path(file_path: &Path) -> Option<PathBuf> {
-    file_path
-        .parent()?
-        .parent()?
-        .parent()?
-        .parent()
-        .map(Path::to_path_buf)
+    root_from_wire_path(file_path)
 }
 
 fn file_modified_timestamp(path: &Path) -> TimestampMs {
@@ -127,18 +140,16 @@ fn file_modified_timestamp(path: &Path) -> TimestampMs {
 
 fn wire_line_to_entry(
     line: &KimiWireLine,
-    file_path: &Path,
     model: &str,
     fallback_timestamp: TimestampMs,
+    context: &KimiWireContext,
 ) -> Option<KimiUsageEntry> {
     if line.r#type.as_deref() == Some("metadata") {
         return None;
     }
     let message = line.message.as_ref()?;
-    if message.r#type.as_deref() != Some("StatusUpdate") {
-        return None;
-    }
-    let payload = message.payload.as_ref()?;
+    let (status_update, child_stream_id) = status_update_message(message)?;
+    let payload = status_update.payload.as_ref()?;
     let token_usage = payload.token_usage.as_ref()?;
     let input_tokens = token_usage.input_other;
     let output_tokens = token_usage.output;
@@ -164,7 +175,8 @@ fn wire_line_to_entry(
     Some(KimiUsageEntry {
         timestamp,
         timestamp_text: crate::format_rfc3339_millis(timestamp),
-        session_id: extract_session_id(file_path),
+        session_id: context.session_id.clone(),
+        stream_id: combine_stream_id(&context.stream_id, &child_stream_id),
         model: model.to_string(),
         message_id: payload.message_id.clone(),
         input_tokens: usage.input_tokens,
@@ -173,6 +185,27 @@ fn wire_line_to_entry(
         cache_read_tokens: usage.cache_read_input_tokens,
         extra_total_tokens,
     })
+}
+
+fn status_update_message(message: &KimiWireMessage) -> Option<(&KimiWireMessage, String)> {
+    match message.r#type.as_deref()? {
+        "StatusUpdate" => Some((message, MAIN_STREAM_ID.to_string())),
+        "SubagentEvent" => {
+            let payload = message.payload.as_ref()?;
+            let event = payload.event.as_deref()?;
+            if event.r#type.as_deref() != Some("StatusUpdate") {
+                return None;
+            }
+            let subagent_id = payload
+                .task_tool_call_id
+                .as_deref()
+                .or(payload.agent_id.as_deref())
+                .or(payload.parent_tool_call_id.as_deref())
+                .unwrap_or("unknown");
+            Some((event, format!("subagent:{subagent_id}")))
+        }
+        _ => None,
+    }
 }
 
 fn timestamp_from_seconds(seconds: f64) -> Option<TimestampMs> {
@@ -186,7 +219,7 @@ fn timestamp_from_seconds(seconds: f64) -> Option<TimestampMs> {
     Some(TimestampMs::from_millis(millis as i64))
 }
 
-fn extract_session_id(file_path: &Path) -> String {
+fn extract_session_id_from_parent(file_path: &Path) -> String {
     file_path
         .parent()
         .and_then(Path::file_name)
@@ -198,8 +231,9 @@ fn extract_session_id(file_path: &Path) -> String {
 
 pub(super) fn kimi_entry_key(entry: &KimiUsageEntry) -> String {
     format!(
-        "{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
         entry.session_id,
+        entry.stream_id,
         entry.message_id.as_deref().unwrap_or_default(),
         entry.timestamp_text,
         entry.model,
@@ -347,7 +381,9 @@ mod tests {
         }))
         .unwrap();
 
-        let entry = wire_line_to_entry(&line, &file, "kimi-k2", TimestampMs::UNIX_EPOCH).unwrap();
+        let context = wire_context_from_path(&file).unwrap();
+        let entry =
+            wire_line_to_entry(&line, "kimi-k2", TimestampMs::UNIX_EPOCH, &context).unwrap();
 
         assert_eq!(entry.output_tokens, 432);
         assert_eq!(entry.extra_total_tokens, 0);
@@ -368,6 +404,7 @@ mod tests {
             timestamp: TimestampMs::from_millis(1_776_698_890_071),
             timestamp_text: "2026-04-20T15:28:10.071Z".to_string(),
             session_id: "session-a".to_string(),
+            stream_id: MAIN_STREAM_ID.to_string(),
             model: DEFAULT_MODEL.to_string(),
             message_id: Some("msg-before".to_string()),
             input_tokens: usage.input_tokens,

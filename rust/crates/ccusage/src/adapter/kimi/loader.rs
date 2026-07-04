@@ -87,6 +87,60 @@ mod tests {
     }
 
     #[test]
+    fn loads_nested_subagent_wire_files_under_parent_session() {
+        let fixture = fs_fixture!({
+            "config.json": r#"{"model":"kimi-k2"}"#,
+            "sessions/group/session-a/wire.jsonl": r#"{"timestamp":1770983427.123,"message":{"type":"StatusUpdate","payload":{"token_usage":{"input_other":100,"output":50,"input_cache_read":10,"input_cache_creation":20},"message_id":"main-1"}}}"#,
+            "sessions/group/session-a/subagents/agent-1/wire.jsonl": r#"{"timestamp":1770983428.123,"message":{"type":"StatusUpdate","payload":{"token_usage":{"input_other":200,"output":60,"input_cache_read":20,"input_cache_creation":30},"message_id":"main-1"}}}"#,
+        });
+        let _cleanup = EnvVarGuard::set(KIMI_DATA_DIR_ENV, fixture.root());
+        let entries = load_entries(&SharedArgs::default(), &PricingMap::load_embedded()).unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.session_id.as_ref() == "session-a")
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.data.message.usage.input_tokens)
+                .sum::<u64>(),
+            300
+        );
+    }
+
+    #[test]
+    fn loads_subagent_event_token_usage_from_parent_wire_files() {
+        let fixture = fs_fixture!({
+            "config.json": r#"{"model":"kimi-k2"}"#,
+            "sessions/group/session-a/wire.jsonl": [
+                r#"{"timestamp":1770983427.123,"message":{"type":"StatusUpdate","payload":{"token_usage":{"input_other":100,"output":50,"input_cache_read":10,"input_cache_creation":20},"message_id":"shared-id"}}}"#,
+                r#"{"timestamp":1770983427.123,"message":{"type":"StatusUpdate","payload":{"token_usage":{"input_other":100,"output":50,"input_cache_read":10,"input_cache_creation":20},"message_id":"shared-id"}}}"#,
+                r#"{"timestamp":1770983427.123,"message":{"type":"SubagentEvent","payload":{"task_tool_call_id":"tool-1","event":{"type":"StatusUpdate","payload":{"token_usage":{"input_other":100,"output":50,"input_cache_read":10,"input_cache_creation":20},"message_id":"shared-id"}}}}}"#,
+            ]
+            .join("\n"),
+        });
+        let _cleanup = EnvVarGuard::set(KIMI_DATA_DIR_ENV, fixture.root());
+        let entries = load_entries(&SharedArgs::default(), &PricingMap::load_embedded()).unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.session_id.as_ref() == "session-a")
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.data.message.usage.input_tokens)
+                .sum::<u64>(),
+            200
+        );
+    }
+
+    #[test]
     fn skips_malformed_and_zero_token_wire_lines() {
         let fixture = fs_fixture!({
             "sessions/group/session-a/wire.jsonl": [
