@@ -246,6 +246,7 @@ fn is_agent_command(command: &str) -> bool {
             | "qwen"
             | "copilot"
             | "gemini"
+            | "antigravity"
             | "kimi"
             | "openclaw"
     )

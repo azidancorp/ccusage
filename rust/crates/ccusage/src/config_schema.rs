@@ -42,6 +42,8 @@ pub(crate) struct CcusageConfig {
     pub(crate) copilot: Option<CopilotConfig>,
     /// Gemini CLI configuration.
     pub(crate) gemini: Option<GeminiConfig>,
+    /// Antigravity configuration.
+    pub(crate) antigravity: Option<AntigravityConfig>,
     /// Kimi configuration.
     pub(crate) kimi: Option<KimiConfig>,
     /// Qwen configuration.
@@ -253,6 +255,21 @@ pub(crate) struct GeminiConfig {
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GeminiCommandsConfig {
+    pub(crate) daily: Option<SharedOptions>,
+    pub(crate) monthly: Option<SharedOptions>,
+    pub(crate) session: Option<SharedOptions>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AntigravityConfig {
+    pub(crate) defaults: Option<SharedOptions>,
+    pub(crate) commands: Option<AntigravityCommandsConfig>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AntigravityCommandsConfig {
     pub(crate) daily: Option<SharedOptions>,
     pub(crate) monthly: Option<SharedOptions>,
     pub(crate) session: Option<SharedOptions>,
@@ -1008,6 +1025,7 @@ mod tests {
         assert!(schema_property(&schema, &["openclaw", "defaults", "openClawPath"]).is_some());
         assert!(schema_property(&schema, &["kilo", "defaults", "openClawPath"]).is_none());
         assert!(schema_property(&schema, &["gemini", "defaults", "openClawPath"]).is_none());
+        assert!(schema_property(&schema, &["antigravity", "defaults", "openClawPath"]).is_none());
         assert!(schema_property(&schema, &["kimi", "defaults", "openClawPath"]).is_none());
         assert!(schema_property(&schema, &["qwen", "defaults", "openClawPath"]).is_none());
     }
@@ -1042,8 +1060,24 @@ mod tests {
             &schema,
             "ccusage-config",
             &[
-                "$schema", "amp", "claude", "codebuff", "codex", "commands", "copilot", "defaults",
-                "gemini", "goose", "hermes", "kilo", "kimi", "opencode", "openclaw", "pi", "qwen",
+                "$schema",
+                "amp",
+                "claude",
+                "codebuff",
+                "codex",
+                "commands",
+                "copilot",
+                "defaults",
+                "gemini",
+                "antigravity",
+                "goose",
+                "hermes",
+                "kilo",
+                "kimi",
+                "opencode",
+                "openclaw",
+                "pi",
+                "qwen",
                 "droid",
             ],
         );
@@ -1167,6 +1201,13 @@ mod tests {
                 }
             },
             "gemini": {
+                "commands": {
+                    "session": {
+                        "json": true
+                    }
+                }
+            },
+            "antigravity": {
                 "commands": {
                     "session": {
                         "json": true

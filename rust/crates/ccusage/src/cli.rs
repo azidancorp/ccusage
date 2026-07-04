@@ -33,6 +33,7 @@ pub(crate) enum Command {
     Kilo(AgentCommandArgs),
     Copilot(AgentCommandArgs),
     Gemini(AgentCommandArgs),
+    Antigravity(AgentCommandArgs),
     Kimi(AgentCommandArgs),
     Qwen(AgentCommandArgs),
     OpenClaw(AgentCommandArgs),
@@ -438,6 +439,13 @@ fn parse_command(
             STANDARD_AGENT_REPORTS,
             Command::Gemini,
         ),
+        "antigravity" => parse_basic_agent_command(
+            parser,
+            shared,
+            "antigravity",
+            STANDARD_AGENT_REPORTS,
+            Command::Antigravity,
+        ),
         "kimi" => parse_basic_agent_command(
             parser,
             shared,
@@ -826,6 +834,7 @@ fn is_command(arg: &str) -> bool {
             | "kilo"
             | "copilot"
             | "gemini"
+            | "antigravity"
             | "kimi"
             | "qwen"
     )
@@ -970,6 +979,7 @@ fn is_agent_command(command: &str) -> bool {
             | "kilo"
             | "copilot"
             | "gemini"
+            | "antigravity"
             | "kimi"
             | "qwen"
             | "openclaw"
@@ -985,7 +995,7 @@ fn agent_report_supported(agent: &str, report: &str) -> bool {
         "codex" => matches!(report, "daily" | "monthly" | "session"),
         "opencode" => matches!(report, "daily" | "weekly" | "monthly" | "session"),
         "amp" | "droid" | "codebuff" | "hermes" | "pi" | "goose" | "kilo" | "copilot"
-        | "gemini" | "kimi" | "qwen" | "openclaw" => {
+        | "gemini" | "antigravity" | "kimi" | "qwen" | "openclaw" => {
             matches!(report, "daily" | "monthly" | "session")
         }
         _ => false,
@@ -1006,6 +1016,7 @@ fn agent_display_name(agent: &str) -> &'static str {
         "kilo" => "Kilo",
         "copilot" => "GitHub Copilot CLI",
         "gemini" => "Gemini CLI",
+        "antigravity" => "Antigravity",
         "kimi" => "Kimi",
         "qwen" => "Qwen",
         "openclaw" => "OpenClaw",
@@ -1317,6 +1328,14 @@ fn help_text_for_tokens(tokens: &[String]) -> String {
                     ("session", "Show Gemini CLI usage grouped by session"),
                 ],
             ),
+            "antigravity" => agent_help(
+                "antigravity",
+                &[
+                    ("daily", "Show Antigravity usage grouped by date"),
+                    ("monthly", "Show Antigravity usage grouped by month"),
+                    ("session", "Show Antigravity usage grouped by session"),
+                ],
+            ),
             "kimi" => agent_help(
                 "kimi",
                 &[
@@ -1361,6 +1380,7 @@ fn help_text_for_tokens(tokens: &[String]) -> String {
             "kilo" => kilo_report_help(report),
             "copilot" => copilot_report_help(report),
             "gemini" => gemini_report_help(report),
+            "antigravity" => antigravity_report_help(report),
             "kimi" => kimi_report_help(report),
             "qwen" => qwen_report_help(report),
             "openclaw" => openclaw_report_help(report),
@@ -1414,6 +1434,7 @@ fn root_help_text() -> String {
         "  kilo                       Show Kilo usage commands",
         "  copilot                    Show GitHub Copilot CLI usage commands",
         "  gemini                     Show Gemini CLI usage commands",
+        "  antigravity                Show Antigravity usage commands",
         "  kimi                       Show Kimi usage commands",
         "  qwen                       Show Qwen usage commands",
         "  openclaw                   Show OpenClaw usage commands",
@@ -1437,6 +1458,7 @@ fn root_help_text() -> String {
         "  ccusage kilo --help",
         "  ccusage copilot --help",
         "  ccusage gemini --help",
+        "  ccusage antigravity --help",
         "  ccusage kimi --help",
         "  ccusage qwen --help",
         "  ccusage openclaw --help",
@@ -1664,6 +1686,20 @@ fn gemini_report_help(report: &str) -> String {
     )
 }
 
+fn antigravity_report_help(report: &str) -> String {
+    let description = match report {
+        "daily" => "Show Antigravity usage grouped by date",
+        "monthly" => "Show Antigravity usage grouped by month",
+        "session" => "Show Antigravity usage grouped by session",
+        _ => return root_help_text(),
+    };
+    command_help(
+        description,
+        &format!("ccusage antigravity {report} <OPTIONS>"),
+        agent_options(),
+    )
+}
+
 fn kimi_report_help(report: &str) -> String {
     let description = match report {
         "daily" => "Show Kimi usage grouped by date",
@@ -1849,6 +1885,7 @@ mod tests {
             Some(Command::Kilo(args)) => agent_command_snapshot("kilo", args),
             Some(Command::Copilot(args)) => agent_command_snapshot("copilot", args),
             Some(Command::Gemini(args)) => agent_command_snapshot("gemini", args),
+            Some(Command::Antigravity(args)) => agent_command_snapshot("antigravity", args),
             Some(Command::Kimi(args)) => agent_command_snapshot("kimi", args),
             Some(Command::Qwen(args)) => agent_command_snapshot("qwen", args),
             Some(Command::OpenClaw(args)) => agent_command_snapshot("openclaw", args),
@@ -2096,8 +2133,22 @@ mod tests {
     fn root_help_lists_agent_namespaces_without_nested_commands() {
         let help = help_text();
         let agents = [
-            "claude", "codex", "opencode", "amp", "droid", "codebuff", "hermes", "pi", "goose",
-            "kilo", "copilot", "gemini", "kimi", "qwen", "openclaw",
+            "claude",
+            "codex",
+            "opencode",
+            "amp",
+            "droid",
+            "codebuff",
+            "hermes",
+            "pi",
+            "goose",
+            "kilo",
+            "copilot",
+            "gemini",
+            "antigravity",
+            "kimi",
+            "qwen",
+            "openclaw",
         ];
 
         for agent in agents {
@@ -2624,6 +2675,16 @@ mod tests {
         let cli = parse(&["ccusage", "gemini", "session", "--json"]);
         let Some(Command::Gemini(args)) = cli.command else {
             panic!("expected gemini command");
+        };
+        assert_eq!(args.kind, AgentReportKind::Session);
+        assert!(args.shared.json);
+    }
+
+    #[test]
+    fn parses_antigravity_session_options() {
+        let cli = parse(&["ccusage", "antigravity", "session", "--json"]);
+        let Some(Command::Antigravity(args)) = cli.command else {
+            panic!("expected antigravity command");
         };
         assert_eq!(args.kind, AgentReportKind::Session);
         assert!(args.shared.json);

@@ -2,7 +2,7 @@
 
 ccusage only supports a coding agent when it can read local usage records with enough information to produce accurate reports. At minimum, a source needs local timestamps, session identity, model identity, and token counts or recorded costs that can be mapped to token usage.
 
-If a tool stores only prompts, transcripts, quota percentages, or opaque cloud state, ccusage does not estimate token usage from text length. That would make daily, monthly, session, and cost reports look precise while being based on guesses.
+If a tool stores only prompts, transcripts, quota percentages, or opaque cloud state, ccusage does not estimate token usage from text length in upstream-grade adapters. That would make daily, monthly, session, and cost reports look precise while being based on guesses.
 
 ## What Makes a Source Supportable?
 
@@ -17,17 +17,19 @@ A source is a good fit when its local files include most of the following:
 
 Local transcript text alone is not enough. A transcript can be useful for debugging, but it does not reveal tokenizer behavior, hidden system context, cached input, tool-call overhead, or provider-side accounting.
 
-## Unsupported Sources Investigated
+## Heuristic Sources
 
-::: details Why is Antigravity CLI not supported?
+::: details Why is Antigravity CLI heuristic-only on this branch?
 Antigravity CLI is separate from Gemini CLI. The Antigravity CLI binary is exposed as `agy`, and it stores state under `~/.gemini/antigravity-cli/`.
 
-The current local data has conversation files such as `conversations/<conversation-id>.pb`, plus lightweight history and cache JSON files. The `.pb` files are opaque binary payloads and do not expose readable token usage, model usage, or per-turn accounting without Antigravity's private schema and storage semantics.
+The local conversation database does not expose official input, output, cache, or reasoning token counts. This branch therefore supports `ccusage antigravity` with a personal heuristic instead of upstream-grade token accounting.
 
-The CLI log files include operational events such as conversation creation, streaming, prompt length, auth, and model configuration messages. They do not include input, output, cache, or reasoning token counts. Quota-oriented tools can inspect remaining Antigravity quota, but quota snapshots are not the same as historical per-session token usage.
+The heuristic reads strings from Antigravity conversation steps, converts characters to tokens with a `3.8 chars/token` estimate, and prices all rows as Gemini 3.5 Flash Standard. Every user message is treated as a cache reset: the next model request counts the full accumulated prompt as uncached, while autonomous continuation steps count previously sent context as cache-read and only newly added context as uncached.
 
-Because the local files do not expose the token accounting needed for ccusage reports, Antigravity CLI is not supported right now.
+Use these reports as personal estimates, not as exact provider billing records.
 :::
+
+## Unsupported Sources Investigated
 
 ::: details Why is Grok CLI not supported?
 Grok CLI was investigated, but its local SQLite data did not contain usable token accounting. Without token counts, model usage, or recorded costs in the local database, ccusage has nothing reliable to aggregate.
