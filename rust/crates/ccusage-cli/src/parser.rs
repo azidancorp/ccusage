@@ -108,6 +108,10 @@ fn parse_command(
     config: &dyn CliConfig,
     default_session_duration_hours: f64,
 ) -> Result<Command, String> {
+    if shared.show_models && !matches!(command, "daily" | "monthly" | "weekly" | "session") {
+        return Err("--with-models is only supported for all-agent reports".to_string());
+    }
+
     match command {
         "daily" => parse_all_command(parser, shared, AgentReportKind::Daily, config),
         "monthly" => parse_all_command(parser, shared, AgentReportKind::Monthly, config),
@@ -308,6 +312,10 @@ fn parse_top_level_session_command(
             parser.next();
             continue;
         }
+        if matches!(parser.peek(), Some("--with-models")) {
+            parse_shared_arg(parser, &mut args.shared)?;
+            continue;
+        }
         if parse_shared_arg_for_command(parser, &mut args.shared)? {
             continue;
         }
@@ -318,6 +326,9 @@ fn parse_top_level_session_command(
     }
 
     if args.id.is_some() {
+        if args.shared.show_models {
+            return Err("--with-models is only supported for all-agent reports".to_string());
+        }
         return Ok(Command::Session(args));
     }
 
@@ -607,6 +618,7 @@ fn parse_shared_arg(parser: &mut ArgParser, shared: &mut SharedArgs) -> Result<(
         "-q" | "--jq" => shared.jq = Some(parser.value_for("--jq")?),
         "--config" => shared.config = Some(PathBuf::from(parser.value_for("--config")?)),
         "--compact" => shared.compact = true,
+        "--with-models" => shared.show_models = true,
         "--single-thread" => shared.single_thread = true,
         "--no-cost" => shared.no_cost = true,
         flag => return Err(format!("Unknown option '{flag}'")),

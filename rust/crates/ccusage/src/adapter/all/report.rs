@@ -83,27 +83,47 @@ pub(super) fn print_table(
         terminal_width,
         crate::USAGE_COMPACT_WIDTH_THRESHOLD,
     );
-    let (headers, aligns) = all_table_columns(kind, compact, shared.no_cost);
+    let show_models = shared.show_models || shared.breakdown;
+    let (headers, aligns) = all_table_columns(kind, compact, show_models, shared.no_cost);
     let mut table = SimpleTable::new(headers, aligns, crate::terminal_style(shared))
         .with_terminal_width(terminal_width)
         .with_date_compaction(true);
 
     for row in rows {
-        table.push(all_table_row(row, compact, false, shared.no_cost));
+        table.push(all_table_row(
+            row,
+            compact,
+            false,
+            show_models,
+            shared.no_cost,
+        ));
         if let Some(agent_breakdowns) = row.agent_breakdowns.as_ref() {
             for breakdown in agent_breakdowns {
-                table.push(all_table_row(breakdown, compact, true, shared.no_cost));
+                table.push(all_table_row(
+                    breakdown,
+                    compact,
+                    true,
+                    show_models,
+                    shared.no_cost,
+                ));
                 if shared.breakdown && !breakdown.model_breakdowns.is_empty() {
                     push_model_breakdown_rows(
                         &mut table,
                         &breakdown.model_breakdowns,
                         compact,
+                        show_models,
                         shared,
                     );
                 }
             }
         } else if shared.breakdown && !row.model_breakdowns.is_empty() {
-            push_model_breakdown_rows(&mut table, &row.model_breakdowns, compact, shared);
+            push_model_breakdown_rows(
+                &mut table,
+                &row.model_breakdowns,
+                compact,
+                show_models,
+                shared,
+            );
         }
     }
     table.separator();
@@ -137,6 +157,9 @@ pub(super) fn print_table(
         ];
         if shared.no_cost {
             total_row.pop();
+        }
+        if !show_models {
+            total_row.remove(2);
         }
         table.push(total_row);
     } else {
@@ -178,6 +201,9 @@ pub(super) fn print_table(
         ];
         if shared.no_cost {
             total_row.pop();
+        }
+        if !show_models {
+            total_row.remove(2);
         }
         table.push(total_row);
     }
@@ -263,6 +289,7 @@ pub(super) fn all_table_row(
     row: &AllRow,
     compact: bool,
     breakdown: bool,
+    show_models: bool,
     no_cost: bool,
 ) -> Vec<String> {
     let period = if breakdown {
@@ -287,11 +314,13 @@ pub(super) fn all_table_row(
         let mut values = vec![
             period,
             agent,
-            models,
             format_number(row.input_tokens),
             format_number(row.output_tokens),
             format_currency(row.total_cost),
         ];
+        if show_models {
+            values.insert(2, models);
+        }
         if no_cost {
             values.pop();
         }
@@ -301,7 +330,6 @@ pub(super) fn all_table_row(
     let mut values = vec![
         period,
         agent,
-        models,
         format_number(row.input_tokens),
         format_number(row.output_tokens),
         format_number(row.cache_creation_tokens),
@@ -309,6 +337,9 @@ pub(super) fn all_table_row(
         format_number(table_total_tokens(row)),
         format_currency(row.total_cost),
     ];
+    if show_models {
+        values.insert(2, models);
+    }
     if no_cost {
         values.pop();
     }
@@ -326,6 +357,7 @@ fn push_model_breakdown_rows(
     table: &mut SimpleTable,
     breakdowns: &[ModelBreakdown],
     compact: bool,
+    show_models: bool,
     shared: &SharedArgs,
 ) {
     for b in breakdowns {
@@ -339,19 +371,20 @@ fn push_model_breakdown_rows(
         if compact {
             let mut row = vec![
                 String::new(),
-                String::new(),
                 model,
                 color(shared, format_number(b.input_tokens), Color::Grey),
                 color(shared, format_number(b.output_tokens), Color::Grey),
                 color(shared, format_currency(b.cost), Color::Grey),
             ];
+            if show_models {
+                row.insert(1, String::new());
+            }
             if shared.no_cost {
                 row.pop();
             }
             table.push(row);
         } else {
             let mut row = vec![
-                String::new(),
                 String::new(),
                 model,
                 color(shared, format_number(b.input_tokens), Color::Grey),
@@ -361,6 +394,9 @@ fn push_model_breakdown_rows(
                 color(shared, format_number(total), Color::Grey),
                 color(shared, format_currency(b.cost), Color::Grey),
             ];
+            if show_models {
+                row.insert(1, String::new());
+            }
             if shared.no_cost {
                 row.pop();
             }
@@ -372,20 +408,13 @@ fn push_model_breakdown_rows(
 pub(super) fn all_table_columns(
     kind: AgentReportKind,
     compact: bool,
+    show_models: bool,
     no_cost: bool,
 ) -> (Vec<&'static str>, Vec<Align>) {
     let (mut headers, mut aligns) = if compact {
         (
+            vec![first_column(kind), "Agent", "Input", "Output", "Cost (USD)"],
             vec![
-                first_column(kind),
-                "Agent",
-                "Models",
-                "Input",
-                "Output",
-                "Cost (USD)",
-            ],
-            vec![
-                Align::Left,
                 Align::Left,
                 Align::Left,
                 Align::Right,
@@ -398,7 +427,6 @@ pub(super) fn all_table_columns(
             vec![
                 first_column(kind),
                 "Agent",
-                "Models",
                 "Input",
                 "Output",
                 "Cache Create",
@@ -407,7 +435,6 @@ pub(super) fn all_table_columns(
                 "Cost (USD)",
             ],
             vec![
-                Align::Left,
                 Align::Left,
                 Align::Left,
                 Align::Right,
@@ -419,6 +446,10 @@ pub(super) fn all_table_columns(
             ],
         )
     };
+    if show_models {
+        headers.insert(2, "Models");
+        aligns.insert(2, Align::Left);
+    }
     if no_cost {
         headers.pop();
         aligns.pop();

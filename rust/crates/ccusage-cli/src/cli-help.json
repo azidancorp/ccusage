@@ -32,6 +32,11 @@
 			"default": "false"
 		},
 		{
+			"flags": "--with-models",
+			"description": "Show model names in table output",
+			"default": "false"
+		},
+		{
 			"flags": "--no-cost",
 			"description": "Hide cost information in table and JSON output",
 			"default": "false"
@@ -176,7 +181,7 @@
 		},
 		{
 			"flags": "--speed [speed]",
-			"description": "Cost speed tier: auto reads Codex config.toml service_tier; use standard or fast to override",
+			"description": "Cost speed tier: auto uses personal historical fast windows; use standard or fast to override",
 			"default": "auto",
 			"choices": ["auto", "standard", "fast"]
 		},

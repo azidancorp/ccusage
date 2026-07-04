@@ -462,7 +462,7 @@ fn displays_total_tokens_with_cache_tokens_like_typescript_table() {
         model_breakdowns: Vec::new(),
     };
 
-    let cells = all_table_row(&row, false, false, false);
+    let cells = all_table_row(&row, false, false, true, false);
 
     assert_eq!(cells[7], "130");
 }
@@ -530,12 +530,13 @@ fn all_table_rows_match_main_agent_breakdown_display() {
     };
 
     assert_eq!(
-        all_table_row(&row, true, false, false),
+        all_table_row(&row, true, false, true, false),
         vec!["2026-01-02", "All", "", "100", "20", "$0.01"]
     );
     assert_eq!(
         all_table_row(
             row.agent_breakdowns.as_ref().unwrap().first().unwrap(),
+            true,
             true,
             true,
             false,
@@ -570,7 +571,7 @@ fn all_report_title_lists_detected_agents() {
 
 #[test]
 fn compact_table_columns_omit_cache_and_total_token_metrics() {
-    let (headers, aligns) = all_table_columns(AgentReportKind::Daily, true, false);
+    let (headers, aligns) = all_table_columns(AgentReportKind::Daily, true, true, false);
 
     assert_eq!(
         headers,
@@ -590,8 +591,52 @@ fn compact_table_columns_omit_cache_and_total_token_metrics() {
 }
 
 #[test]
+fn compact_table_columns_hide_models_by_default() {
+    let (headers, aligns) = all_table_columns(AgentReportKind::Daily, true, false, false);
+
+    assert_eq!(
+        headers,
+        vec!["Date", "Agent", "Input", "Output", "Cost (USD)"]
+    );
+    assert_eq!(
+        aligns,
+        vec![
+            Align::Left,
+            Align::Left,
+            Align::Right,
+            Align::Right,
+            Align::Right,
+        ]
+    );
+}
+
+#[test]
+fn compact_table_rows_hide_models_by_default() {
+    let row = AllRow {
+        period: "2026-01-02".to_string(),
+        agent: "codex",
+        models_used: vec!["gpt-5".to_string()],
+        input_tokens: 100,
+        output_tokens: 20,
+        cache_creation_tokens: 0,
+        cache_read_tokens: 10,
+        total_tokens: 120,
+        total_cost: 0.01,
+        metadata: None,
+        metadata_agents: Some(vec!["codex"]),
+        agent_breakdowns: None,
+        model_breakdowns: Vec::new(),
+    };
+
+    assert_eq!(
+        all_table_row(&row, true, false, false, false),
+        vec!["2026-01-02", "Codex", "100", "20", "$0.01"]
+    );
+}
+
+#[test]
 fn full_table_columns_include_cache_and_total_token_metrics() {
-    let (headers, aligns) = all_table_columns(AgentReportKind::Daily, false, false);
+    let (headers, aligns) = all_table_columns(AgentReportKind::Daily, false, true, false);
 
     assert_eq!(
         headers,

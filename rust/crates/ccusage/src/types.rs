@@ -157,6 +157,7 @@ pub(crate) struct CodexModelUsage {
     pub(crate) output_tokens: u64,
     pub(crate) reasoning_output_tokens: u64,
     pub(crate) total_tokens: u64,
+    pub(crate) cost: Option<f64>,
     pub(crate) is_fallback: bool,
 }
 
@@ -167,6 +168,7 @@ pub(crate) struct CodexGroup {
     pub(crate) output_tokens: u64,
     pub(crate) reasoning_output_tokens: u64,
     pub(crate) total_tokens: u64,
+    pub(crate) cost: Option<f64>,
     pub(crate) models: BTreeMap<String, CodexModelUsage>,
     pub(crate) last_activity: Option<String>,
 }

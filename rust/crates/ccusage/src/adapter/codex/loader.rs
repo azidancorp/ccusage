@@ -767,7 +767,7 @@ mod tests {
     }
 
     #[test]
-    fn skips_replayed_parent_token_history_in_thread_spawn_subagent_files() {
+    fn counts_thread_spawn_subagent_token_history_for_personal_totals() {
         let fixture = fs_fixture!({
             "2026-05-12T08-00-00-parent.jsonl": [
                 json!({
@@ -846,7 +846,7 @@ mod tests {
                     "payload": {"id": "parent-xyz"},
                 })
                 .to_string(),
-                // replayed parent history — timestamps all at subagent creation time
+                // replayed parent history - personal totals count every token_count line
                 json!({
                     "timestamp": "2026-05-12T08:03:00.000Z",
                     "type": "event_msg",
@@ -946,8 +946,8 @@ mod tests {
 
             assert_eq!(
                 events.len(),
-                4,
-                "expected 4 events (2 parent + 2 subagent real), got {} with single_thread={}",
+                6,
+                "expected 6 events (2 parent + 4 subagent token_count lines), got {} with single_thread={}",
                 events.len(),
                 single_thread
             );
@@ -964,16 +964,20 @@ mod tests {
                 .iter()
                 .filter(|e| e.session_id.contains("subagent"))
                 .collect();
-            assert_eq!(subagent_events.len(), 2);
-            assert_eq!(subagent_events[0].input_tokens, 100);
-            assert_eq!(subagent_events[0].output_tokens, 20);
-            assert_eq!(subagent_events[1].input_tokens, 50);
-            assert_eq!(subagent_events[1].output_tokens, 10);
+            assert_eq!(subagent_events.len(), 4);
+            assert_eq!(subagent_events[0].input_tokens, 1_000);
+            assert_eq!(subagent_events[0].output_tokens, 200);
+            assert_eq!(subagent_events[1].input_tokens, 500);
+            assert_eq!(subagent_events[1].output_tokens, 100);
+            assert_eq!(subagent_events[2].input_tokens, 100);
+            assert_eq!(subagent_events[2].output_tokens, 20);
+            assert_eq!(subagent_events[3].input_tokens, 50);
+            assert_eq!(subagent_events[3].output_tokens, 10);
         }
     }
 
     #[test]
-    fn keeps_cumulative_baseline_when_skipping_subagent_replay() {
+    fn keeps_cumulative_baseline_while_counting_subagent_replay() {
         let fixture = fs_fixture!({
             "2026-05-12T08-03-00-subagent.jsonl": [
                 json!({
@@ -1046,15 +1050,23 @@ mod tests {
 
         let events = load_codex_events_from_directory(fixture.root(), true).unwrap();
 
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].input_tokens, 100);
-        assert_eq!(events[0].cached_input_tokens, 10);
-        assert_eq!(events[0].output_tokens, 20);
-        assert_eq!(events[0].total_tokens, 120);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].input_tokens, 1_000);
+        assert_eq!(events[0].cached_input_tokens, 100);
+        assert_eq!(events[0].output_tokens, 200);
+        assert_eq!(events[0].total_tokens, 1_200);
+        assert_eq!(events[1].input_tokens, 500);
+        assert_eq!(events[1].cached_input_tokens, 50);
+        assert_eq!(events[1].output_tokens, 100);
+        assert_eq!(events[1].total_tokens, 600);
+        assert_eq!(events[2].input_tokens, 100);
+        assert_eq!(events[2].cached_input_tokens, 10);
+        assert_eq!(events[2].output_tokens, 20);
+        assert_eq!(events[2].total_tokens, 120);
     }
 
     #[test]
-    fn skips_replayed_history_across_multiple_subagent_files() {
+    fn counts_replayed_history_across_multiple_subagent_files() {
         let parent_line = json!({
             "timestamp": "2026-05-12T08:01:00.000Z",
             "type": "event_msg",
@@ -1102,7 +1114,7 @@ mod tests {
                     "payload": {"id": "parent"},
                 })
                 .to_string(),
-                // replayed entries — two token_count lines with the same timestamp
+                // replayed entries - personal totals count every token_count line
                 json!({
                     "timestamp": creation_ts,
                     "type": "event_msg",
@@ -1199,16 +1211,16 @@ mod tests {
 
             assert_eq!(
                 events.len(),
-                4,
-                "expected 4 events (1 parent + 3 subagent real), got {} with single_thread={}",
+                10,
+                "expected 10 events (1 parent + 9 subagent token_count lines), got {} with single_thread={}",
                 events.len(),
                 single_thread
             );
 
             let total_input: u64 = events.iter().map(|e| e.input_tokens).sum();
             assert_eq!(
-                total_input, 1_150,
-                "expected 1150 total input (1000 parent + 50 + 75 + 25 subagents)"
+                total_input, 4_150,
+                "expected 4150 total input (1000 parent + replayed 3000 + 150 subagent real)"
             );
         }
     }

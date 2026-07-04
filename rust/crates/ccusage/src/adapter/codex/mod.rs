@@ -16,7 +16,6 @@ pub(crate) use report::{
     calculate_codex_model_cost, calculate_group_cost, codex_model_missing_pricing,
     non_cached_input_tokens,
 };
-pub(crate) use speed::resolve_codex_speed;
 
 use report::{print_table_from_groups, report_from_groups};
 
@@ -36,8 +35,8 @@ pub(crate) fn run(args: AgentCommandArgs) -> Result<()> {
         log_level() != Some(0),
         shared.pricing_overrides.iter(),
     );
-    let groups = load_groups(&shared, args.kind)?;
-    let speed = resolve_codex_speed(args.codex_speed);
+    let speed = args.codex_speed;
+    let groups = load_groups(&shared, args.kind, &pricing, speed)?;
     if wants_json(&shared) {
         let output = report_from_groups(&groups, args.kind, &pricing, speed);
         return print_json_or_jq(output, shared.jq.as_deref(), shared.no_cost);
@@ -53,7 +52,7 @@ pub(crate) fn report_json(
     pricing: &PricingMap,
     speed: CodexSpeed,
 ) -> Result<Value> {
-    let groups = aggregate_events(events, kind, timezone)?;
+    let groups = aggregate_events(events, kind, timezone, pricing, speed)?;
     Ok(report_from_groups(&groups, kind, pricing, speed))
 }
 
@@ -83,8 +82,14 @@ mod tests {
             ..SharedArgs::default()
         };
 
-        let groups =
-            load_groups_from_directory(&sessions_dir, &shared, AgentReportKind::Daily).unwrap();
+        let groups = load_groups_from_directory(
+            &sessions_dir,
+            &shared,
+            AgentReportKind::Daily,
+            &PricingMap::default(),
+            CodexSpeed::Standard,
+        )
+        .unwrap();
 
         assert_eq!(groups.len(), 1);
         let group = groups.get("2026-01-03").unwrap();
@@ -108,8 +113,14 @@ mod tests {
             ..SharedArgs::default()
         };
 
-        let groups =
-            load_groups_from_directory(&sessions_dir, &shared, AgentReportKind::Daily).unwrap();
+        let groups = load_groups_from_directory(
+            &sessions_dir,
+            &shared,
+            AgentReportKind::Daily,
+            &PricingMap::default(),
+            CodexSpeed::Standard,
+        )
+        .unwrap();
 
         assert_eq!(groups.len(), 1);
         let group = groups.get("2026-01-02").unwrap();
@@ -222,6 +233,7 @@ mod tests {
             output_tokens: 5,
             reasoning_output_tokens: 0,
             total_tokens: 105,
+            cost: None,
             is_fallback: false,
         };
 
@@ -248,6 +260,7 @@ mod tests {
             output_tokens: 5,
             reasoning_output_tokens: 0,
             total_tokens: 105,
+            cost: None,
             is_fallback: false,
         };
 
@@ -256,6 +269,51 @@ mod tests {
         let fast = calculate_codex_model_cost("gpt-5.3-codex", &usage, &pricing, CodexSpeed::Fast);
 
         assert!((fast - (standard * 2.0)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn applies_auto_speed_cutoff_windows_per_event() {
+        let mut pricing = PricingMap::default();
+        pricing.load_json(
+            r#"{
+                "gpt-test": {
+                    "input_cost_per_token": 1.0,
+                    "output_cost_per_token": 0.0,
+                    "cache_read_input_token_cost": 0.0,
+                    "provider_specific_entry": { "fast": 2.0 }
+                }
+            }"#,
+        );
+        let events = [
+            "2026-05-08T23:59:59.999Z",
+            "2026-05-09T00:00:00.000Z",
+            "2026-05-14T19:33:00.000Z",
+        ]
+        .into_iter()
+        .map(|timestamp| CodexTokenUsageEvent {
+            session_id: "session-1".to_string(),
+            timestamp: timestamp.to_string(),
+            model: Some("gpt-test".to_string()),
+            input_tokens: 1,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: 1,
+            is_fallback_model: false,
+        })
+        .collect::<Vec<_>>();
+
+        let report = report_json(
+            &events,
+            AgentReportKind::Monthly,
+            Some("UTC"),
+            &pricing,
+            CodexSpeed::Auto,
+        )
+        .unwrap();
+
+        assert_eq!(report["monthly"][0]["costUSD"], serde_json::json!(5));
+        assert_eq!(report["totals"]["costUSD"], serde_json::json!(5));
     }
 
     #[test]

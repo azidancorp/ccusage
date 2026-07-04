@@ -51,6 +51,7 @@ pub struct SharedArgs {
     pub jq: Option<String>,
     pub config: Option<PathBuf>,
     pub compact: bool,
+    pub show_models: bool,
     pub single_thread: bool,
     pub no_cost: bool,
     pub pricing_overrides: BTreeMap<String, PricingOverride>,

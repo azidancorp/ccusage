@@ -130,6 +130,7 @@ fn shared_snapshot(shared: &SharedArgs) -> Value {
         "jq": shared.jq.as_deref(),
         "config": shared.config.as_ref().map(|path| path.to_string_lossy().to_string()),
         "compact": shared.compact,
+        "showModels": shared.show_models,
         "singleThread": shared.single_thread,
     })
 }
@@ -929,6 +930,27 @@ fn parses_antigravity_session_options() {
     };
     assert_eq!(args.kind, AgentReportKind::Session);
     assert!(args.shared.json);
+}
+
+#[test]
+fn parses_all_agent_with_models_flag() {
+    let cli = parse(&["ccusage", "daily", "--with-models"]);
+    let Some(Command::All(args)) = cli.command else {
+        panic!("expected all-agent command");
+    };
+    assert!(args.shared.show_models);
+}
+
+#[test]
+fn rejects_with_models_for_single_agent_reports() {
+    assert_eq!(
+        parse_error(&["ccusage", "codex", "daily", "--with-models"]),
+        "Unknown codex option '--with-models'"
+    );
+    assert_eq!(
+        parse_error(&["ccusage", "--with-models", "codex", "daily"]),
+        "--with-models is only supported for all-agent reports"
+    );
 }
 
 #[test]
