@@ -164,9 +164,12 @@ fn calculate_open_code_cost(
     provider: &str,
     usage: TokenUsageRaw,
     cost_usd: Option<f64>,
-    _mode: CostMode,
+    mode: CostMode,
     pricing: Option<&PricingMap>,
 ) -> f64 {
+    if mode == CostMode::Display {
+        return cost_usd.unwrap_or(0.0);
+    }
     if let Some(cost) = cost_usd.filter(|cost| *cost > 0.0) {
         return cost;
     }
@@ -444,6 +447,35 @@ mod tests {
         .unwrap();
 
         assert_eq!(entry.cost, 0.000143);
+    }
+
+    #[test]
+    fn display_mode_does_not_calculate_zero_opencode_cost() {
+        let pricing = PricingMap::load_embedded();
+        let entry = message_value_to_entry(
+            &message(json!({
+                "id": "message-a",
+                "sessionID": "session-a",
+                "providerID": "kimi-for-coding",
+                "modelID": "k2p6",
+                "time": { "created": 0 },
+                "tokens": {
+                    "input": 100,
+                    "output": 10,
+                    "cache": { "read": 50 }
+                },
+                "cost": 0
+            })),
+            None,
+            None,
+            None,
+            CostMode::Display,
+            Some(&pricing),
+        )
+        .unwrap();
+
+        assert_eq!(entry.cost, 0.0);
+        assert_eq!(entry.missing_pricing_model, None);
     }
 
     #[test]

@@ -12,11 +12,12 @@ use serde_json::json;
 use crate::pricing::PricingMap;
 use crate::{
     BucketKind, Color, Context, DEFAULT_RECENT_DAYS, DEFAULT_SESSION_DURATION_HOURS,
-    MILLIS_PER_DAY, MILLIS_PER_MINUTE, Result, SessionAccumulator, TimestampMs, block_json,
-    calculate_burn_rate,
+    MILLIS_PER_DAY, MILLIS_PER_MINUTE, Result, SessionAccumulator, TimestampMs, UsageSummary,
+    adapter::{cache, claude},
+    block_json, calculate_burn_rate,
     cli::{
-        BlocksArgs, CostSource, DailyArgs, SessionArgs, SharedArgs, SortOrder, StatuslineArgs,
-        VisualBurnRate, WeekDay, WeeklyArgs,
+        AgentReportKind, BlocksArgs, CostSource, DailyArgs, SessionArgs, SharedArgs, SortOrder,
+        StatuslineArgs, VisualBurnRate, WeekDay, WeeklyArgs,
     },
     color,
     fast::FxHashMap,
@@ -30,7 +31,7 @@ use crate::{
 
 pub(crate) fn run_daily(args: DailyArgs) -> Result<()> {
     let shared = args.shared.clone();
-    let mut rows = load_daily_summaries(
+    let mut rows = load_claude_daily_summaries_cached(
         &shared,
         args.project.as_deref(),
         args.instances || args.project.is_some(),
@@ -149,7 +150,77 @@ pub(crate) fn run_session(args: SessionArgs) -> Result<()> {
 
     let mut session_shared = shared.clone();
     session_shared.order = SortOrder::Desc;
-    let entries = load_entries(&session_shared, None)?;
+    let rows = load_claude_session_summaries_cached(&session_shared)?;
+
+    if wants_json(&session_shared) {
+        let output = json!({
+            "sessions": rows.iter().map(session_summary_json).collect::<Vec<_>>(),
+            "totals": totals_json(&rows),
+        });
+        print_json_or_jq(output, session_shared.jq.as_deref(), session_shared.no_cost)?;
+        return Ok(());
+    }
+
+    print_usage_table(
+        "Claude Code Token Usage Report - By Session",
+        "Session",
+        &rows,
+        &session_shared,
+        false,
+        None,
+    )?;
+    Ok(())
+}
+
+fn load_claude_daily_summaries_cached(
+    shared: &SharedArgs,
+    project_filter: Option<&str>,
+    group_by_project: bool,
+) -> Result<Vec<UsageSummary>> {
+    let files = claude_source_files(project_filter)?;
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let signature = cache::create_file_state_signature(
+        &files,
+        &[
+            format!("project_filter={project_filter:?}"),
+            format!("group_by_project={group_by_project}"),
+        ],
+    );
+    cache::load_usage_summaries_with_cache(
+        "claude",
+        AgentReportKind::Daily,
+        shared,
+        "claude-daily-summaries-v1",
+        &signature,
+        || load_daily_summaries(shared, project_filter, group_by_project),
+    )
+}
+
+fn load_claude_session_summaries_cached(shared: &SharedArgs) -> Result<Vec<UsageSummary>> {
+    let files = claude_source_files(None)?;
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let signature = cache::create_file_state_signature(&files, &["session_summaries".to_string()]);
+    cache::load_usage_summaries_with_cache(
+        "claude",
+        AgentReportKind::Session,
+        shared,
+        "claude-session-summaries-v1",
+        &signature,
+        || build_claude_session_summaries(shared),
+    )
+}
+
+fn claude_source_files(project_filter: Option<&str>) -> Result<Vec<PathBuf>> {
+    let paths = claude::claude_paths()?;
+    Ok(claude::usage_files(&paths, project_filter))
+}
+
+fn build_claude_session_summaries(session_shared: &SharedArgs) -> Result<Vec<UsageSummary>> {
+    let entries = load_entries(session_shared, None)?;
     let mut grouped = Vec::<SessionAccumulator>::new();
     let mut group_indexes = FxHashMap::<(Arc<str>, Arc<str>), usize>::default();
     for entry in &entries {
@@ -193,25 +264,7 @@ pub(crate) fn run_session(args: SessionArgs) -> Result<()> {
         SortOrder::Asc => a.total_cost.total_cmp(&b.total_cost),
         SortOrder::Desc => b.total_cost.total_cmp(&a.total_cost),
     });
-
-    if wants_json(&session_shared) {
-        let output = json!({
-            "sessions": rows.iter().map(session_summary_json).collect::<Vec<_>>(),
-            "totals": totals_json(&rows),
-        });
-        print_json_or_jq(output, session_shared.jq.as_deref(), session_shared.no_cost)?;
-        return Ok(());
-    }
-
-    print_usage_table(
-        "Claude Code Token Usage Report - By Session",
-        "Session",
-        &rows,
-        &session_shared,
-        false,
-        None,
-    )?;
-    Ok(())
+    Ok(rows)
 }
 
 fn run_session_id(id: &str, shared: &SharedArgs) -> Result<()> {

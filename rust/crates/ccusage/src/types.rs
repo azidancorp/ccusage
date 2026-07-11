@@ -128,7 +128,7 @@ pub(crate) struct LoadedFile {
     pub(crate) entries: Vec<LoadedEntry>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct CodexRawUsage {
     pub(crate) input_tokens: u64,
     pub(crate) cached_input_tokens: u64,
@@ -137,7 +137,7 @@ pub(crate) struct CodexRawUsage {
     pub(crate) total_tokens: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CodexTokenUsageEvent {
     pub(crate) session_id: String,
     pub(crate) timestamp: String,
@@ -150,7 +150,7 @@ pub(crate) struct CodexTokenUsageEvent {
     pub(crate) is_fallback_model: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct CodexModelUsage {
     pub(crate) input_tokens: u64,
     pub(crate) cached_input_tokens: u64,
@@ -169,7 +169,7 @@ pub(crate) struct CodexModelUsage {
     pub(crate) is_fallback: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct CodexGroup {
     pub(crate) input_tokens: u64,
     pub(crate) cached_input_tokens: u64,

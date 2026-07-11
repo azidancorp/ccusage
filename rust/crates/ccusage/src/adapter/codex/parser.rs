@@ -1,13 +1,13 @@
 use std::{
     borrow::Cow,
     fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Seek, SeekFrom},
     path::Path,
     sync::LazyLock,
 };
 
 use memchr::memmem::Finder;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{CodexRawUsage, CodexTokenUsageEvent, Result, TimestampMs};
@@ -60,26 +60,44 @@ struct CodexExecTimestamps {
     model: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(super) struct CodexParserState {
+    pub(super) previous_totals: Option<CodexRawUsage>,
+    pub(super) current_model: Option<String>,
+    pub(super) current_model_is_fallback: bool,
+}
+
 pub(super) fn visit_codex_session_file(
     sessions_dir: &Path,
     path: &Path,
-    mut visit: impl FnMut(CodexTokenUsageEvent) -> Result<()>,
+    visit: impl FnMut(CodexTokenUsageEvent) -> Result<()>,
 ) -> Result<()> {
-    let Ok(file) = fs::File::open(path) else {
-        return Ok(());
+    visit_codex_session_file_from_offset(sessions_dir, path, 0, CodexParserState::default(), visit)
+        .map(|_| ())
+}
+
+pub(super) fn visit_codex_session_file_from_offset(
+    sessions_dir: &Path,
+    path: &Path,
+    offset: u64,
+    mut state: CodexParserState,
+    mut visit: impl FnMut(CodexTokenUsageEvent) -> Result<()>,
+) -> Result<CodexParserState> {
+    let Ok(mut file) = fs::File::open(path) else {
+        return Ok(state);
     };
+    if offset > 0 && file.seek(SeekFrom::Start(offset)).is_err() {
+        return Ok(state);
+    }
     let mut reader = BufReader::with_capacity(128 * 1024, file);
     let mut line = Vec::new();
     let session_id = codex_session_id(sessions_dir, path);
-    let mut previous_totals: Option<CodexRawUsage> = None;
-    let mut current_model: Option<String> = None;
-    let mut current_model_is_fallback = false;
     let fallback_timestamp = file_modified_timestamp(path);
 
     loop {
         line.clear();
         let Ok(bytes_read) = reader.read_until(b'\n', &mut line) else {
-            return Ok(());
+            return Ok(state);
         };
         if bytes_read == 0 {
             break;
@@ -95,9 +113,9 @@ pub(super) fn visit_codex_session_file(
                 visit_codex_session_entry(
                     &session_id,
                     value,
-                    &mut previous_totals,
-                    &mut current_model,
-                    &mut current_model_is_fallback,
+                    &mut state.previous_totals,
+                    &mut state.current_model,
+                    &mut state.current_model_is_fallback,
                     &mut visit,
                 )?;
             }
@@ -107,8 +125,8 @@ pub(super) fn visit_codex_session_file(
                         &session_id,
                         &value,
                         &fallback_timestamp,
-                        &mut current_model,
-                        &mut current_model_is_fallback,
+                        &mut state.current_model,
+                        &mut state.current_model_is_fallback,
                         &mut visit,
                     )?;
                 } else {
@@ -116,8 +134,8 @@ pub(super) fn visit_codex_session_file(
                         &session_id,
                         &line,
                         &fallback_timestamp,
-                        &mut current_model,
-                        &mut current_model_is_fallback,
+                        &mut state.current_model,
+                        &mut state.current_model_is_fallback,
                         &mut visit,
                     )?;
                 };
@@ -125,7 +143,7 @@ pub(super) fn visit_codex_session_file(
         }
     }
 
-    Ok(())
+    Ok(state)
 }
 
 fn visit_codex_session_entry(

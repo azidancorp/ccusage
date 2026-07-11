@@ -41,11 +41,35 @@ fn load_entries_inner(shared: &SharedArgs) -> Result<Vec<LoadedEntry>> {
     Ok(entries)
 }
 
+pub(crate) fn source_files() -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for path in paths()? {
+        if let Some(db_path) = db_path(&path) {
+            let mut wal_path = db_path.as_os_str().to_os_string();
+            wal_path.push("-wal");
+            let wal_path = PathBuf::from(wal_path);
+            files.push(db_path);
+            if wal_path.is_file() {
+                files.push(wal_path);
+            }
+        }
+        collect_files_with_extension(&path.join("storage").join("message"), "json", &mut files);
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
 pub(crate) fn load_entries_from_directory(
     opencode_dir: &Path,
     shared: &SharedArgs,
 ) -> Result<Vec<LoadedEntry>> {
-    let pricing = if shared.mode == CostMode::Display {
+    let cost_mode = if shared.no_cost {
+        CostMode::Display
+    } else {
+        shared.mode
+    };
+    let pricing = if cost_mode == CostMode::Display {
         None
     } else {
         Some(PricingMap::load_with_overrides(
@@ -59,7 +83,7 @@ pub(crate) fn load_entries_from_directory(
     let mut seen = HashSet::new();
     if let Some(db_path) = db_path(opencode_dir) {
         for entry in
-            load_entries_from_database(&db_path, tz.as_ref(), shared.mode, pricing.as_ref(), shared)
+            load_entries_from_database(&db_path, tz.as_ref(), cost_mode, pricing.as_ref(), shared)
         {
             if let Some(id) = entry_id(&entry)
                 && !seen.insert(id.to_string())
@@ -92,7 +116,7 @@ pub(crate) fn load_entries_from_directory(
     // over the results in their original file order so parallelism never changes
     // which duplicate survives.
     let loaded = read_files_parallel(&files, shared.single_thread, |file| {
-        read_message_file(file, tz.as_ref(), shared.mode, pricing.as_ref(), shared)
+        read_message_file(file, tz.as_ref(), cost_mode, pricing.as_ref(), shared)
     });
     for entry in loaded.into_iter().flatten() {
         if let Some(id) = entry_id(&entry)
@@ -225,9 +249,9 @@ fn entry_id(entry: &LoadedEntry) -> Option<&str> {
 mod tests {
     use std::path::Path;
 
-    use super::load_entries_from_directory;
+    use super::{load_entries_from_directory, source_files};
     use crate::cli::{CostMode, SharedArgs};
-    use ccusage_test_support::fs_fixture;
+    use ccusage_test_support::{EnvVarGuard, fs_fixture};
 
     fn create_db_message(path: &Path, id: &str, session_id: &str, data: &str) {
         let db = sqlite::open(path).unwrap();
@@ -240,6 +264,22 @@ mod tests {
         statement.bind((2, session_id)).unwrap();
         statement.bind((3, data)).unwrap();
         statement.next().unwrap();
+    }
+
+    #[test]
+    fn source_files_include_sqlite_wal() {
+        let fixture = fs_fixture!({
+            "opencode.db": "",
+            "opencode.db-wal": "",
+        });
+        let _data_dir = EnvVarGuard::set("OPENCODE_DATA_DIR", fixture.root());
+
+        let files = source_files().unwrap();
+
+        assert_eq!(
+            files,
+            vec![fixture.path("opencode.db"), fixture.path("opencode.db-wal")]
+        );
     }
 
     #[test]
@@ -318,6 +358,26 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].session_id.as_ref(), "channel-session-a");
         assert_eq!(entries[0].data.message.usage.input_tokens, 80);
+    }
+
+    #[test]
+    fn no_cost_skips_zero_cost_recalculation() {
+        let fixture = fs_fixture!({});
+        create_db_message(
+            &fixture.path("opencode.db"),
+            "db-msg-1",
+            "db-session-a",
+            r#"{"providerID":"kimi-for-coding","modelID":"k2p6","time":{"created":1767312000000},"tokens":{"input":100,"output":10,"cache":{"read":50}},"cost":0}"#,
+        );
+
+        let shared = SharedArgs {
+            no_cost: true,
+            ..SharedArgs::default()
+        };
+        let entries = load_entries_from_directory(fixture.root(), &shared).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].cost, 0.0);
     }
 
     #[test]

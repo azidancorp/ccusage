@@ -3,6 +3,7 @@ use crate::cli::CodexSpeed;
 const CODEX_FAST_COST_MULTIPLIER_START_MILLIS: i64 = 1_775_520_000_000; // 2026-04-07T00:00:00.000Z
 const CODEX_FAST_COST_MULTIPLIER_END_MILLIS: i64 = 1_778_284_800_000; // 2026-05-09T00:00:00.000Z
 const CODEX_FAST_COST_MULTIPLIER_RESTART_MILLIS: i64 = 1_778_787_180_000; // 2026-05-14T19:33:00.000Z
+const CODEX_FAST_COST_MULTIPLIER_LATEST_END_MILLIS: i64 = 1_783_674_380_097; // 2026-07-10T09:06:20.097Z
 
 pub(crate) fn resolve_codex_speed_for_timestamp(
     requested: CodexSpeed,
@@ -19,7 +20,8 @@ fn is_codex_fast_window(timestamp: crate::TimestampMs) -> bool {
     let millis = timestamp.as_millis();
     (CODEX_FAST_COST_MULTIPLIER_START_MILLIS..CODEX_FAST_COST_MULTIPLIER_END_MILLIS)
         .contains(&millis)
-        || millis >= CODEX_FAST_COST_MULTIPLIER_RESTART_MILLIS
+        || (CODEX_FAST_COST_MULTIPLIER_RESTART_MILLIS..CODEX_FAST_COST_MULTIPLIER_LATEST_END_MILLIS)
+            .contains(&millis)
 }
 
 #[cfg(test)]
@@ -32,6 +34,8 @@ mod tests {
         let before_gap = crate::parse_ts_timestamp("2026-05-08T23:59:59.999Z").unwrap();
         let gap_start = crate::parse_ts_timestamp("2026-05-09T00:00:00.000Z").unwrap();
         let restart = crate::parse_ts_timestamp("2026-05-14T19:33:00.000Z").unwrap();
+        let before_latest_cutoff = crate::parse_ts_timestamp("2026-07-10T09:06:20.096Z").unwrap();
+        let latest_cutoff = crate::parse_ts_timestamp("2026-07-10T09:06:20.097Z").unwrap();
 
         assert_eq!(
             resolve_codex_speed_for_timestamp(CodexSpeed::Auto, before_gap),
@@ -44,6 +48,14 @@ mod tests {
         assert_eq!(
             resolve_codex_speed_for_timestamp(CodexSpeed::Auto, restart),
             CodexSpeed::Fast
+        );
+        assert_eq!(
+            resolve_codex_speed_for_timestamp(CodexSpeed::Auto, before_latest_cutoff),
+            CodexSpeed::Fast
+        );
+        assert_eq!(
+            resolve_codex_speed_for_timestamp(CodexSpeed::Auto, latest_cutoff),
+            CodexSpeed::Standard
         );
         assert_eq!(
             resolve_codex_speed_for_timestamp(CodexSpeed::Standard, restart),

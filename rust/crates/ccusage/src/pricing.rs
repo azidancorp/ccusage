@@ -1,7 +1,9 @@
 use std::{
     borrow::Cow,
+    env, fs,
+    path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
-    time::{Duration, Instant},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use ccusage_cli::PricingOverride;
@@ -18,8 +20,11 @@ const FAST_MULTIPLIER_OVERRIDES_JSON: &str = include_str!("fast-multiplier-overr
 const LITELLM_PRICING_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 const MODELS_DEV_API_URL: &str = "https://models.dev/api.json";
-const PRICING_FETCH_TIMEOUT_SECONDS: u64 = 10;
+const PRICING_FETCH_TIMEOUT_SECONDS: u64 = 2;
 const PRICING_FETCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const PRICING_JSON_CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const LITELLM_PRICING_CACHE_FILE: &str = "litellm-pricing.json";
+const MODELS_DEV_PRICING_CACHE_FILE: &str = "models-dev-api.json";
 const MODELS_DEV_FAILURE_RETRY_AFTER: Duration = Duration::from_secs(60);
 // Anthropic date-suffixed model aliases use YYYYMMDD, while other numeric
 // suffixes are treated as distinct model versions.
@@ -1126,15 +1131,17 @@ impl PricingMap {
                 ..glm_base
             },
         );
-        self.entries.insert(
-            "glm-5.1".to_string(),
-            Pricing {
-                input: 1.4e-6,
-                output: 4.4e-6,
-                cache_read: 0.26e-6,
-                ..glm_base
-            },
-        );
+        let glm_51_pricing = Pricing {
+            input: 1.4e-6,
+            output: 4.4e-6,
+            cache_read: 0.26e-6,
+            ..glm_base
+        };
+        self.entries.insert("glm-5.1".to_string(), glm_51_pricing);
+        self.entries.insert("glm-5.2".to_string(), glm_51_pricing);
+        for model in ["glm-5", "glm-5-turbo", "glm-5.1", "glm-5.2"] {
+            self.context_limits.insert(model.to_string(), 200_000);
+        }
         self.context_limits.insert("gpt-5.5".to_string(), 1_050_000);
         self.context_limits
             .insert("grok-4.3".to_string(), 1_000_000);
@@ -1453,11 +1460,25 @@ where
 }
 
 fn fetch_pricing_json() -> std::io::Result<String> {
-    fetch_json_url(LITELLM_PRICING_URL)
+    fetch_cached_json_url(LITELLM_PRICING_URL, LITELLM_PRICING_CACHE_FILE)
 }
 
 fn fetch_models_dev_json() -> std::io::Result<String> {
-    fetch_json_url(MODELS_DEV_API_URL)
+    fetch_cached_json_url(MODELS_DEV_API_URL, MODELS_DEV_PRICING_CACHE_FILE)
+}
+
+fn fetch_cached_json_url(url: &str, cache_file: &str) -> std::io::Result<String> {
+    if let Some(json) = read_pricing_json_cache(cache_file, PRICING_JSON_CACHE_MAX_AGE) {
+        return Ok(json);
+    }
+
+    match fetch_json_url(url) {
+        Ok(json) => {
+            write_pricing_json_cache(cache_file, &json);
+            Ok(json)
+        }
+        Err(error) => read_pricing_json_cache(cache_file, Duration::MAX).ok_or(error),
+    }
 }
 
 fn fetch_json_url(url: &str) -> std::io::Result<String> {
@@ -1483,6 +1504,47 @@ fn fetch_json_url(url: &str) -> std::io::Result<String> {
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))
 }
 
+fn read_pricing_json_cache(cache_file: &str, max_age: Duration) -> Option<String> {
+    let path = pricing_json_cache_path(cache_file)?;
+    let metadata = fs::metadata(&path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let modified = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?;
+    if now.checked_sub(modified).is_none_or(|age| age > max_age) {
+        return None;
+    }
+    fs::read_to_string(path).ok()
+}
+
+fn write_pricing_json_cache(cache_file: &str, json: &str) {
+    let Some(path) = pricing_json_cache_path(cache_file) else {
+        return;
+    };
+    if let Some(parent) = path.parent()
+        && fs::create_dir_all(parent).is_err()
+    {
+        return;
+    }
+    let _ = fs::write(path, json);
+}
+
+fn pricing_json_cache_path(cache_file: &str) -> Option<PathBuf> {
+    if cache_file.contains(std::path::MAIN_SEPARATOR)
+        || Path::new(cache_file).components().count() != 1
+    {
+        return None;
+    }
+    let root = env::var_os("XDG_CACHE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| crate::home::home_dir().map(|home| home.join(".cache")))?;
+    Some(root.join("ccusage").join("pricing").join(cache_file))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1490,7 +1552,25 @@ mod tests {
         embedded_models_dev_pricing, long_context_split_threshold, model_without_date_suffix,
     };
     use ccusage_test_support::fs_fixture;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+
+    #[test]
+    fn pricing_json_cache_uses_xdg_cache_home_and_rejects_nested_names() {
+        let fixture = ccusage_test_support::Fixture::new();
+        let _cache_home = ccusage_test_support::EnvVarGuard::set("XDG_CACHE_HOME", fixture.root());
+
+        super::write_pricing_json_cache("fresh.json", r#"{"ok":true}"#);
+
+        assert_eq!(
+            super::read_pricing_json_cache("fresh.json", Duration::MAX).as_deref(),
+            Some(r#"{"ok":true}"#)
+        );
+        assert!(super::pricing_json_cache_path("../bad.json").is_none());
+        assert!(super::pricing_json_cache_path("nested/bad.json").is_none());
+    }
 
     #[test]
     fn loads_embedded_claude_pricing() {
@@ -1543,6 +1623,14 @@ mod tests {
         assert_eq!(glm_51.cache_create, 0.0);
         assert_eq!(glm_51.cache_read, 0.26e-6);
         assert!(glm_51.cache_read_explicit);
+
+        let glm_52 = pricing.find("glm-5.2").unwrap();
+        assert_eq!(glm_52.input, 1.4e-6);
+        assert_eq!(glm_52.output, 4.4e-6);
+        assert_eq!(glm_52.cache_create, 0.0);
+        assert_eq!(glm_52.cache_read, 0.26e-6);
+        assert!(glm_52.cache_read_explicit);
+        assert_eq!(pricing.context_limit("zai/glm-5.2"), Some(200_000));
 
         let glm_5 = pricing.find("glm-5").unwrap();
         assert_eq!(glm_5.input, 1.0e-6);

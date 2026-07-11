@@ -78,6 +78,60 @@ fn loads_agent_rows_concurrently() {
 }
 
 #[test]
+fn caches_agent_rows_until_source_file_changes() {
+    let cache_fixture = ccusage_test_support::Fixture::new();
+    let _cache_home =
+        ccusage_test_support::EnvVarGuard::set("XDG_CACHE_HOME", cache_fixture.root());
+    let source_fixture = ccusage_test_support::Fixture::new();
+    let source = source_fixture.write_file("source.jsonl", "first");
+    let shared = SharedArgs {
+        timezone: Some("UTC".to_string()),
+        ..SharedArgs::default()
+    };
+    let mut load_count = 0;
+
+    let first = load_agent_rows_cached(
+        "claude",
+        AgentReportKind::Daily,
+        &shared,
+        || Ok(vec![source.clone()]),
+        Vec::new(),
+        || {
+            load_count += 1;
+            Ok(test_agent_rows("claude"))
+        },
+    )
+    .unwrap();
+    let second = load_agent_rows_cached(
+        "claude",
+        AgentReportKind::Daily,
+        &shared,
+        || Ok(vec![source.clone()]),
+        Vec::new(),
+        || Err(crate::cli_error("cache miss")),
+    )
+    .unwrap();
+    std::fs::write(&source, "second").unwrap();
+    let third = load_agent_rows_cached(
+        "claude",
+        AgentReportKind::Daily,
+        &shared,
+        || Ok(vec![source.clone()]),
+        Vec::new(),
+        || {
+            load_count += 1;
+            Ok(test_agent_rows("claude"))
+        },
+    )
+    .unwrap();
+
+    assert_eq!(first.rows.len(), 1);
+    assert_eq!(second.rows.len(), 1);
+    assert_eq!(third.rows.len(), 1);
+    assert_eq!(load_count, 2);
+}
+
+#[test]
 fn aggregates_daily_agent_rows_by_period() {
     let rows = aggregate_rows(
         vec![

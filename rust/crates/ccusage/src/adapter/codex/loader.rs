@@ -3,48 +3,32 @@ use std::{
     thread,
 };
 
+#[cfg(test)]
 use compact_str::CompactString;
 
-use crate::{
-    CodexTokenUsageEvent, Result, chunk_file_indexes_by_size, cli::SharedArgs, fast::FxHashSet,
-    progress,
-};
+#[cfg(test)]
+use crate::fast::FxHashSet;
+use crate::{CodexTokenUsageEvent, Result, chunk_file_indexes_by_size};
 
+#[cfg(test)]
+use super::paths::CodexUsageSource;
 use super::{
     parser::visit_codex_session_file,
-    paths::{
-        CodexUsageSource, codex_usage_sources, collect_codex_usage_files,
-        collect_deduped_codex_usage_files,
-    },
+    paths::{codex_usage_sources, collect_codex_usage_files, collect_deduped_codex_usage_files},
 };
 
+#[cfg(test)]
 pub(crate) fn load_codex_events_from_directory(
     sessions_dir: &Path,
     single_thread: bool,
 ) -> Result<Vec<CodexTokenUsageEvent>> {
     let files = collect_codex_usage_files(sessions_dir);
-    let mut events = if single_thread {
-        files
-            .iter()
-            .flat_map(|file| read_codex_session_file(sessions_dir, file))
-            .collect::<Vec<_>>()
-    } else {
-        read_codex_session_files_parallel(sessions_dir, &files)
-    };
+    let mut events = load_codex_events_for_files(sessions_dir, &files, single_thread);
     dedupe_codex_events(&mut events);
     Ok(events)
 }
 
-pub(crate) fn load_codex_events(shared: &SharedArgs) -> Result<Vec<CodexTokenUsageEvent>> {
-    progress::track_usage_load(progress::UsageLoadAgent::Codex, shared.json, || {
-        load_codex_events_inner(shared)
-    })
-}
-
-fn load_codex_events_inner(shared: &SharedArgs) -> Result<Vec<CodexTokenUsageEvent>> {
-    load_codex_events_from_sources(&codex_usage_sources()?, shared.single_thread)
-}
-
+#[cfg(test)]
 fn load_codex_events_from_sources(
     sources: &[CodexUsageSource],
     single_thread: bool,
@@ -55,25 +39,60 @@ fn load_codex_events_from_sources(
 
     let mut events = Vec::new();
     for group in collect_deduped_codex_usage_files(sources) {
-        let mut source_events = if single_thread {
-            group
-                .files
-                .iter()
-                .flat_map(|file| read_codex_session_file(&group.dir, file))
-                .collect::<Vec<_>>()
-        } else {
-            read_codex_session_files_parallel(&group.dir, &group.files)
-        };
+        let mut source_events =
+            load_codex_events_for_files(&group.dir, &group.files, single_thread);
         events.append(&mut source_events);
     }
     dedupe_codex_events(&mut events);
     Ok(events)
 }
 
-fn read_codex_session_files_parallel(
+pub(crate) fn source_files() -> Result<Vec<PathBuf>> {
+    let sources = codex_usage_sources()?;
+    let mut files = if let [source] = sources.as_slice() {
+        collect_codex_usage_files(&source.dir)
+    } else {
+        collect_deduped_codex_usage_files(&sources)
+            .into_iter()
+            .flat_map(|group| group.files)
+            .collect::<Vec<_>>()
+    };
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+pub(super) fn load_codex_events_for_files(
     sessions_dir: &Path,
     files: &[PathBuf],
+    single_thread: bool,
 ) -> Vec<CodexTokenUsageEvent> {
+    if single_thread {
+        crate::adapter::cache::load_file_rows_with_cache(
+            "codex",
+            "codex-events-v3",
+            files,
+            |misses| {
+                misses
+                    .iter()
+                    .map(|file| read_codex_session_file(sessions_dir, file))
+                    .collect()
+            },
+        )
+    } else {
+        crate::adapter::cache::load_file_rows_with_cache(
+            "codex",
+            "codex-events-v3",
+            files,
+            |misses| read_codex_session_files_parallel_grouped(sessions_dir, misses),
+        )
+    }
+}
+
+fn read_codex_session_files_parallel_grouped(
+    sessions_dir: &Path,
+    files: &[PathBuf],
+) -> Vec<Vec<CodexTokenUsageEvent>> {
     let worker_count = thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1)
@@ -81,7 +100,7 @@ fn read_codex_session_files_parallel(
     if worker_count <= 1 {
         return files
             .iter()
-            .flat_map(|file| read_codex_session_file(sessions_dir, file))
+            .map(|file| read_codex_session_file(sessions_dir, file))
             .collect();
     }
 
@@ -105,11 +124,7 @@ fn read_codex_session_files_parallel(
         {
             loaded_files[index] = Some(events);
         }
-        loaded_files
-            .into_iter()
-            .flatten()
-            .flatten()
-            .collect::<Vec<_>>()
+        loaded_files.into_iter().flatten().collect::<Vec<_>>()
     })
 }
 
@@ -122,6 +137,7 @@ fn read_codex_session_file(sessions_dir: &Path, path: &Path) -> Vec<CodexTokenUs
     events
 }
 
+#[cfg(test)]
 fn dedupe_codex_events(events: &mut Vec<CodexTokenUsageEvent>) {
     let mut seen = FxHashSet::default();
     events.retain(|event| {

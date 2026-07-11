@@ -8,33 +8,55 @@ use std::{
 
 use jiff::tz::TimeZone as JiffTimeZone;
 use rustc_hash::FxHasher;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     CodexGroup, CodexTokenUsageEvent, PricingMap, Result,
+    adapter::cache::FileState,
     cli::{AgentReportKind, CodexSpeed, SharedArgs, WeekDay},
     fast::FxHashSet,
     format_date_tz, parse_ts_timestamp, parse_tz, wants_json, week_start,
 };
 
-use super::{parser, paths, report::calculate_codex_event_cost};
+use super::{loader, parser, paths, report::calculate_codex_event_cost};
 
-type CodexEventKey = (
-    u64,
-    usize,
-    crate::TimestampMs,
-    u64,
-    usize,
-    u64,
-    u64,
-    u64,
-    u64,
-    u64,
-);
+type CodexEventKey = (u64, usize, i64, u64, usize, u64, u64, u64, u64, u64);
 type CodexDedupeShards = [Mutex<FxHashSet<CodexEventKey>>];
 
-struct CodexAggregation {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedCodexGroups {
+    file_states: BTreeMap<String, FileState>,
+    parser_states: BTreeMap<String, CachedCodexParserState>,
+    complete_lines: BTreeMap<String, bool>,
+    seen: Vec<CodexEventKey>,
     groups: BTreeMap<String, CodexGroup>,
-    seen: FxHashSet<CodexEventKey>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedCodexParserState {
+    previous_totals: Option<crate::CodexRawUsage>,
+    current_model: Option<String>,
+    current_model_is_fallback: bool,
+}
+
+impl From<parser::CodexParserState> for CachedCodexParserState {
+    fn from(state: parser::CodexParserState) -> Self {
+        Self {
+            previous_totals: state.previous_totals,
+            current_model: state.current_model,
+            current_model_is_fallback: state.current_model_is_fallback,
+        }
+    }
+}
+
+impl From<CachedCodexParserState> for parser::CodexParserState {
+    fn from(state: CachedCodexParserState) -> Self {
+        Self {
+            previous_totals: state.previous_totals,
+            current_model: state.current_model,
+            current_model_is_fallback: state.current_model_is_fallback,
+        }
+    }
 }
 
 pub(crate) fn load_groups(
@@ -44,12 +66,265 @@ pub(crate) fn load_groups(
     speed: CodexSpeed,
 ) -> Result<BTreeMap<String, CodexGroup>> {
     let sources = paths::codex_usage_sources()?;
-    if sources.len() == 1 && !wants_json(shared) {
-        return load_groups_from_directory(&sources[0].dir, shared, kind, pricing, speed);
+    let files = source_files_from_sources(&sources);
+    let file_states = file_states_for_files(&files);
+    let signature =
+        crate::adapter::cache::create_file_state_signature(&files, &[format!("speed={speed:?}")]);
+    if let Some((cached_signature, cached)) = crate::adapter::cache::read_source_value_cache_entry::<
+        CachedCodexGroups,
+    >("codex", kind, shared, "codex-groups-v2")
+    {
+        if cached_signature == signature {
+            return Ok(cached.groups);
+        }
+        if let Some(updated) = update_cached_groups_for_appends(
+            cached,
+            &sources,
+            &file_states,
+            shared,
+            kind,
+            pricing,
+            speed,
+        )? {
+            crate::adapter::cache::write_source_value_cache_entry(
+                "codex",
+                kind,
+                shared,
+                "codex-groups-v2",
+                &signature,
+                &updated,
+            );
+            return Ok(updated.groups);
+        }
     }
-    load_groups_from_sources(&sources, shared, kind, pricing, speed)
+
+    let loaded = load_groups_cache_value(&sources, file_states, shared, kind, pricing, speed)?;
+    crate::adapter::cache::write_source_value_cache_entry(
+        "codex",
+        kind,
+        shared,
+        "codex-groups-v2",
+        &signature,
+        &loaded,
+    );
+    Ok(loaded.groups)
 }
 
+fn load_groups_uncached_with_seen(
+    sources: &[paths::CodexUsageSource],
+    shared: &SharedArgs,
+    kind: AgentReportKind,
+    pricing: &PricingMap,
+    speed: CodexSpeed,
+) -> Result<(BTreeMap<String, CodexGroup>, Vec<CodexEventKey>)> {
+    if sources.len() == 1 && !wants_json(shared) {
+        return load_groups_from_directory_with_seen(&sources[0].dir, shared, kind, pricing, speed);
+    }
+    load_groups_from_sources_with_seen(sources, shared, kind, pricing, speed)
+}
+
+fn load_groups_cache_value(
+    sources: &[paths::CodexUsageSource],
+    file_states: BTreeMap<String, FileState>,
+    shared: &SharedArgs,
+    kind: AgentReportKind,
+    pricing: &PricingMap,
+    speed: CodexSpeed,
+) -> Result<CachedCodexGroups> {
+    let (groups, seen) = load_groups_uncached_with_seen(sources, shared, kind, pricing, speed)?;
+    let parser_states = parser_states_for_recent_files(sources, &file_states, 8)?;
+    let complete_lines = parser_states
+        .keys()
+        .filter_map(|file| {
+            let path = Path::new(file);
+            file_ends_with_newline(path).map(|complete| (file.clone(), complete))
+        })
+        .collect();
+    Ok(CachedCodexGroups {
+        file_states,
+        parser_states,
+        complete_lines,
+        seen,
+        groups,
+    })
+}
+
+fn update_cached_groups_for_appends(
+    mut cached: CachedCodexGroups,
+    sources: &[paths::CodexUsageSource],
+    current_states: &BTreeMap<String, FileState>,
+    shared: &SharedArgs,
+    kind: AgentReportKind,
+    pricing: &PricingMap,
+    speed: CodexSpeed,
+) -> Result<Option<CachedCodexGroups>> {
+    if cached
+        .file_states
+        .keys()
+        .any(|file| !current_states.contains_key(file))
+    {
+        return Ok(None);
+    }
+
+    let source_dirs = source_dirs_by_file(sources);
+    let mut changed = Vec::new();
+    for (file, current) in current_states {
+        match cached.file_states.get(file) {
+            Some(previous) if previous == current => {}
+            Some(previous)
+                if current.size > previous.size
+                    && cached.complete_lines.get(file).copied().unwrap_or(false)
+                    && cached.parser_states.contains_key(file) =>
+            {
+                changed.push((file.clone(), previous.size))
+            }
+            None => changed.push((file.clone(), 0)),
+            Some(_) => return Ok(None),
+        }
+    }
+    if changed.is_empty() {
+        cached.file_states = current_states.clone();
+        return Ok(Some(cached));
+    }
+    if changed.len() > 16 {
+        return Ok(None);
+    }
+
+    let timezone = parse_tz(shared.timezone.as_deref()).or_else(|| Some(JiffTimeZone::system()));
+    let mut seen = cached.seen.iter().copied().collect::<FxHashSet<_>>();
+    for (file, offset) in changed {
+        let Some(sessions_dir) = source_dirs.get(&file) else {
+            return Ok(None);
+        };
+        let path = Path::new(&file);
+        let parser_state = if offset == 0 {
+            parser::CodexParserState::default()
+        } else {
+            let Some(state) = cached.parser_states.remove(&file) else {
+                return Ok(None);
+            };
+            state.into()
+        };
+        let next_state = parser::visit_codex_session_file_from_offset(
+            sessions_dir,
+            path,
+            offset,
+            parser_state,
+            |event| {
+                add_event_to_groups_with_seen_set(
+                    &event,
+                    kind,
+                    timezone.as_ref(),
+                    shared,
+                    pricing,
+                    speed,
+                    &mut seen,
+                    &mut cached.groups,
+                )
+            },
+        )?;
+        cached
+            .parser_states
+            .insert(file.clone(), CachedCodexParserState::from(next_state));
+        if let Some(complete) = file_ends_with_newline(path) {
+            cached.complete_lines.insert(file.clone(), complete);
+        }
+        if let Some(state) = current_states.get(&file) {
+            cached.file_states.insert(file, *state);
+        }
+    }
+    cached.seen = seen.into_iter().collect();
+    Ok(Some(cached))
+}
+
+fn source_files_from_sources(sources: &[paths::CodexUsageSource]) -> Vec<PathBuf> {
+    let mut files = if let [source] = sources {
+        paths::collect_codex_usage_files(&source.dir)
+    } else {
+        paths::collect_deduped_codex_usage_files(sources)
+            .into_iter()
+            .flat_map(|group| group.files)
+            .collect::<Vec<_>>()
+    };
+    files.sort();
+    files.dedup();
+    files
+}
+
+fn file_states_for_files(files: &[PathBuf]) -> BTreeMap<String, FileState> {
+    files
+        .iter()
+        .filter_map(|file| {
+            crate::adapter::cache::file_state(file)
+                .map(|state| (file.to_string_lossy().into_owned(), state))
+        })
+        .collect()
+}
+
+fn source_dirs_by_file(sources: &[paths::CodexUsageSource]) -> BTreeMap<String, PathBuf> {
+    if let [source] = sources {
+        return paths::collect_codex_usage_files(&source.dir)
+            .into_iter()
+            .map(|file| (file.to_string_lossy().into_owned(), source.dir.clone()))
+            .collect();
+    }
+    paths::collect_deduped_codex_usage_files(sources)
+        .into_iter()
+        .flat_map(|group| {
+            group
+                .files
+                .into_iter()
+                .map(move |file| (file.to_string_lossy().into_owned(), group.dir.clone()))
+        })
+        .collect()
+}
+
+fn parser_states_for_recent_files(
+    sources: &[paths::CodexUsageSource],
+    file_states: &BTreeMap<String, FileState>,
+    limit: usize,
+) -> Result<BTreeMap<String, CachedCodexParserState>> {
+    let source_dirs = source_dirs_by_file(sources);
+    let mut files = file_states.iter().collect::<Vec<_>>();
+    files.sort_by(|(_, left), (_, right)| {
+        right
+            .modified_secs
+            .cmp(&left.modified_secs)
+            .then_with(|| right.modified_nanos.cmp(&left.modified_nanos))
+            .then_with(|| right.size.cmp(&left.size))
+    });
+    let mut states = BTreeMap::new();
+    for (file, _) in files.into_iter().take(limit) {
+        let Some(sessions_dir) = source_dirs.get(file) else {
+            continue;
+        };
+        let state = parser::visit_codex_session_file_from_offset(
+            sessions_dir,
+            Path::new(file),
+            0,
+            parser::CodexParserState::default(),
+            |_| Ok(()),
+        )?;
+        states.insert(file.clone(), CachedCodexParserState::from(state));
+    }
+    Ok(states)
+}
+
+fn file_ends_with_newline(path: &Path) -> Option<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len == 0 {
+        return Some(true);
+    }
+    file.seek(SeekFrom::End(-1)).ok()?;
+    let mut byte = [0_u8; 1];
+    file.read_exact(&mut byte).ok()?;
+    Some(byte[0] == b'\n')
+}
+
+#[cfg(test)]
 fn load_groups_from_sources(
     sources: &[paths::CodexUsageSource],
     shared: &SharedArgs,
@@ -57,6 +332,16 @@ fn load_groups_from_sources(
     pricing: &PricingMap,
     speed: CodexSpeed,
 ) -> Result<BTreeMap<String, CodexGroup>> {
+    Ok(load_groups_from_sources_with_seen(sources, shared, kind, pricing, speed)?.0)
+}
+
+fn load_groups_from_sources_with_seen(
+    sources: &[paths::CodexUsageSource],
+    shared: &SharedArgs,
+    kind: AgentReportKind,
+    pricing: &PricingMap,
+    speed: CodexSpeed,
+) -> Result<(BTreeMap<String, CodexGroup>, Vec<CodexEventKey>)> {
     let mut groups = BTreeMap::new();
     let seen = create_dedupe_shards();
     for group in paths::collect_deduped_codex_usage_files(sources) {
@@ -73,9 +358,11 @@ fn load_groups_from_sources(
             )?,
         );
     }
-    Ok(groups)
+    let seen = collect_seen_keys(&seen);
+    Ok((groups, seen))
 }
 
+#[cfg(test)]
 pub(super) fn load_groups_from_directory(
     sessions_dir: &Path,
     shared: &SharedArgs,
@@ -83,12 +370,21 @@ pub(super) fn load_groups_from_directory(
     pricing: &PricingMap,
     speed: CodexSpeed,
 ) -> Result<BTreeMap<String, CodexGroup>> {
+    Ok(load_groups_from_directory_with_seen(sessions_dir, shared, kind, pricing, speed)?.0)
+}
+
+fn load_groups_from_directory_with_seen(
+    sessions_dir: &Path,
+    shared: &SharedArgs,
+    kind: AgentReportKind,
+    pricing: &PricingMap,
+    speed: CodexSpeed,
+) -> Result<(BTreeMap<String, CodexGroup>, Vec<CodexEventKey>)> {
     let files = paths::collect_codex_usage_files(sessions_dir);
-    if shared.single_thread {
-        return aggregate_files_local(sessions_dir, &files, shared, kind, pricing, speed);
-    }
     let seen = create_dedupe_shards();
-    aggregate_files_parallel(sessions_dir, &files, shared, kind, pricing, speed, &seen)
+    let groups = aggregate_files(sessions_dir, &files, shared, kind, pricing, speed, &seen)?;
+    let seen = collect_seen_keys(&seen);
+    Ok((groups, seen))
 }
 
 fn aggregate_files_with_dedupe(
@@ -100,10 +396,7 @@ fn aggregate_files_with_dedupe(
     speed: CodexSpeed,
     seen: &CodexDedupeShards,
 ) -> Result<BTreeMap<String, CodexGroup>> {
-    if shared.single_thread {
-        return aggregate_files(sessions_dir, files, shared, kind, pricing, speed, seen);
-    }
-    aggregate_files_parallel(sessions_dir, files, shared, kind, pricing, speed, seen)
+    aggregate_files(sessions_dir, files, shared, kind, pricing, speed, seen)
 }
 
 fn aggregate_files(
@@ -117,10 +410,10 @@ fn aggregate_files(
 ) -> Result<BTreeMap<String, CodexGroup>> {
     let mut groups = BTreeMap::new();
     let timezone = parse_tz(shared.timezone.as_deref()).or_else(|| Some(JiffTimeZone::system()));
-    for file in files {
-        aggregate_file(
-            sessions_dir,
-            file,
+    let events = loader::load_codex_events_for_files(sessions_dir, files, shared.single_thread);
+    for event in events {
+        add_event_to_groups(
+            &event,
             kind,
             timezone.as_ref(),
             shared,
@@ -131,131 +424,6 @@ fn aggregate_files(
         )?;
     }
     Ok(groups)
-}
-
-fn aggregate_files_parallel(
-    sessions_dir: &Path,
-    files: &[PathBuf],
-    shared: &SharedArgs,
-    kind: AgentReportKind,
-    pricing: &PricingMap,
-    speed: CodexSpeed,
-    seen: &CodexDedupeShards,
-) -> Result<BTreeMap<String, CodexGroup>> {
-    let worker_count = thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
-        .min(files.len());
-    if worker_count <= 1 {
-        return aggregate_files(sessions_dir, files, shared, kind, pricing, speed, seen);
-    }
-
-    let chunks = crate::chunk_file_indexes_by_size(files, worker_count);
-    thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(chunks.len());
-        for chunk in chunks {
-            handles.push(scope.spawn(move || {
-                let mut groups = BTreeMap::new();
-                let timezone =
-                    parse_tz(shared.timezone.as_deref()).or_else(|| Some(JiffTimeZone::system()));
-                for index in chunk {
-                    aggregate_file(
-                        sessions_dir,
-                        &files[index],
-                        kind,
-                        timezone.as_ref(),
-                        shared,
-                        pricing,
-                        speed,
-                        seen,
-                        &mut groups,
-                    )?;
-                }
-                Result::<BTreeMap<String, CodexGroup>>::Ok(groups)
-            }));
-        }
-
-        let mut groups = BTreeMap::new();
-        for handle in handles {
-            merge_groups(
-                &mut groups,
-                handle
-                    .join()
-                    .map_err(|_| crate::cli_error("codex worker panicked"))??,
-            );
-        }
-        Ok(groups)
-    })
-}
-
-fn aggregate_file(
-    sessions_dir: &Path,
-    file: &Path,
-    kind: AgentReportKind,
-    timezone: Option<&JiffTimeZone>,
-    shared: &SharedArgs,
-    pricing: &PricingMap,
-    speed: CodexSpeed,
-    seen: &CodexDedupeShards,
-    groups: &mut BTreeMap<String, CodexGroup>,
-) -> Result<()> {
-    parser::visit_codex_session_file(sessions_dir, file, |event| {
-        add_event_to_groups(&event, kind, timezone, shared, pricing, speed, seen, groups)
-    })
-}
-
-fn aggregate_files_local(
-    sessions_dir: &Path,
-    files: &[PathBuf],
-    shared: &SharedArgs,
-    kind: AgentReportKind,
-    pricing: &PricingMap,
-    speed: CodexSpeed,
-) -> Result<BTreeMap<String, CodexGroup>> {
-    Ok(aggregate_files_local_with_seen(sessions_dir, files, shared, kind, pricing, speed)?.groups)
-}
-
-fn aggregate_files_local_with_seen(
-    sessions_dir: &Path,
-    files: &[PathBuf],
-    shared: &SharedArgs,
-    kind: AgentReportKind,
-    pricing: &PricingMap,
-    speed: CodexSpeed,
-) -> Result<CodexAggregation> {
-    let mut aggregation = CodexAggregation {
-        groups: BTreeMap::new(),
-        seen: FxHashSet::default(),
-    };
-    let timezone = parse_tz(shared.timezone.as_deref()).or_else(|| Some(JiffTimeZone::system()));
-    for file in files {
-        aggregate_file_local(
-            sessions_dir,
-            file,
-            kind,
-            timezone.as_ref(),
-            shared,
-            pricing,
-            speed,
-            &mut aggregation,
-        )?;
-    }
-    Ok(aggregation)
-}
-
-fn aggregate_file_local(
-    sessions_dir: &Path,
-    file: &Path,
-    kind: AgentReportKind,
-    timezone: Option<&JiffTimeZone>,
-    shared: &SharedArgs,
-    pricing: &PricingMap,
-    speed: CodexSpeed,
-    aggregation: &mut CodexAggregation,
-) -> Result<()> {
-    parser::visit_codex_session_file(sessions_dir, file, |event| {
-        add_event_to_groups_local(&event, kind, timezone, shared, pricing, speed, aggregation)
-    })
 }
 
 fn add_event_to_groups(
@@ -290,14 +458,15 @@ fn add_event_to_groups(
     )
 }
 
-fn add_event_to_groups_local(
+fn add_event_to_groups_with_seen_set(
     event: &CodexTokenUsageEvent,
     kind: AgentReportKind,
     timezone: Option<&JiffTimeZone>,
     shared: &SharedArgs,
     pricing: &PricingMap,
     speed: CodexSpeed,
-    aggregation: &mut CodexAggregation,
+    seen: &mut FxHashSet<CodexEventKey>,
+    groups: &mut BTreeMap<String, CodexGroup>,
 ) -> Result<()> {
     let Some(model) = event.model.as_deref().filter(|model| !model.is_empty()) else {
         return Ok(());
@@ -305,10 +474,7 @@ fn add_event_to_groups_local(
     let model = crate::model_aliases::resolve_model_name(model);
     let timestamp = parse_ts_timestamp(&event.timestamp)
         .ok_or_else(|| crate::cli_error(format!("Invalid Codex timestamp: {}", event.timestamp)))?;
-    if !aggregation
-        .seen
-        .insert(codex_event_key(event, timestamp, model.as_ref(), kind))
-    {
+    if !seen.insert(codex_event_key(event, timestamp, model.as_ref(), kind)) {
         return Ok(());
     }
     add_deduped_event_to_groups(
@@ -320,7 +486,7 @@ fn add_event_to_groups_local(
         shared,
         pricing,
         speed,
-        &mut aggregation.groups,
+        groups,
     )
 }
 
@@ -407,6 +573,12 @@ fn create_dedupe_shards() -> Vec<Mutex<FxHashSet<CodexEventKey>>> {
         .collect()
 }
 
+fn collect_seen_keys(seen: &CodexDedupeShards) -> Vec<CodexEventKey> {
+    seen.iter()
+        .flat_map(|shard| shard.lock().unwrap().iter().copied().collect::<Vec<_>>())
+        .collect()
+}
+
 fn insert_event_key(
     event: &CodexTokenUsageEvent,
     timestamp: crate::TimestampMs,
@@ -435,7 +607,7 @@ fn codex_event_key(
     (
         session_hash,
         session_len,
-        timestamp,
+        timestamp.as_millis(),
         hash_text(model),
         model.len(),
         event.input_tokens,
@@ -489,6 +661,7 @@ fn merge_groups(target: &mut BTreeMap<String, CodexGroup>, source: BTreeMap<Stri
     }
 }
 
+#[cfg(test)]
 pub(crate) fn aggregate_events(
     events: &[CodexTokenUsageEvent],
     kind: AgentReportKind,
@@ -519,40 +692,83 @@ pub(crate) fn aggregate_events(
     Ok(groups)
 }
 
-pub(crate) fn filter_events_by_date(
-    events: &mut Vec<CodexTokenUsageEvent>,
-    shared: &SharedArgs,
-) -> Result<()> {
-    if shared.since.is_none() && shared.until.is_none() {
-        return Ok(());
-    }
-    let timezone = parse_tz(shared.timezone.as_deref()).or_else(|| Some(JiffTimeZone::system()));
-    let mut kept = Vec::with_capacity(events.len());
-    for event in events.drain(..) {
-        let timestamp = parse_ts_timestamp(&event.timestamp).ok_or_else(|| {
-            crate::cli_error(format!("Invalid Codex timestamp: {}", event.timestamp))
-        })?;
-        let date = format_date_tz(timestamp, timezone.as_ref()).replace('-', "");
-        if shared.since.as_ref().is_none_or(|since| &date >= since)
-            && shared.until.as_ref().is_none_or(|until| &date <= until)
-        {
-            kept.push(event);
-        }
-    }
-    *events = kept;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use ccusage_test_support::fs_fixture;
+    use ccusage_test_support::{EnvVarsGuard, Fixture, fs_fixture};
     use serde_json::json;
 
     use crate::{
         adapter::codex::paths::CodexUsageSource, model_aliases::set_model_aliases_for_tests,
     };
+
+    #[test]
+    fn same_size_rewrite_rebuilds_codex_groups() {
+        let usage_line = |input_tokens: u64| {
+            json!({
+                "timestamp": "2026-07-09T08:01:00.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "model": "gpt-5.2",
+                        "last_token_usage": {
+                            "input_tokens": input_tokens,
+                            "cached_input_tokens": 0,
+                            "output_tokens": 10,
+                            "reasoning_output_tokens": 0,
+                            "total_tokens": input_tokens + 10,
+                        },
+                    },
+                },
+            })
+            .to_string()
+                + "\n"
+        };
+        let first_line = usage_line(100);
+        let second_line = usage_line(200);
+        assert_eq!(first_line.len(), second_line.len());
+
+        let fixture = fs_fixture!({
+            "codex/sessions/session.jsonl": &first_line,
+        });
+        let cache = Fixture::new();
+        let _env = EnvVarsGuard::set_many([
+            ("CODEX_HOME", Some(fixture.path("codex").into_os_string())),
+            (
+                "XDG_CACHE_HOME",
+                Some(cache.root().as_os_str().to_os_string()),
+            ),
+        ]);
+        let shared = SharedArgs {
+            json: true,
+            offline: true,
+            timezone: Some("UTC".to_string()),
+            ..SharedArgs::default()
+        };
+        let pricing = PricingMap::default();
+
+        let first = load_groups(
+            &shared,
+            AgentReportKind::Daily,
+            &pricing,
+            CodexSpeed::Standard,
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        std::fs::write(fixture.path("codex/sessions/session.jsonl"), second_line).unwrap();
+        let second = load_groups(
+            &shared,
+            AgentReportKind::Daily,
+            &pricing,
+            CodexSpeed::Standard,
+        )
+        .unwrap();
+
+        assert_eq!(first["2026-07-09"].input_tokens, 100);
+        assert_eq!(second["2026-07-09"].input_tokens, 200);
+    }
 
     #[test]
     fn dedupes_copied_token_usage_across_session_files() {
