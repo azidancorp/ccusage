@@ -9,6 +9,7 @@ use crate::{Result, collect_files_with_extension};
 pub(super) const KIMI_DATA_DIR_ENV: &str = "KIMI_DATA_DIR";
 pub(super) const KIMI_MODEL_NAME_ENV: &str = "KIMI_MODEL_NAME";
 pub(super) const KIMI_SESSIONS_DIR_NAME: &str = "sessions";
+pub(super) const KIMI_AGENTS_DIR_NAME: &str = "agents";
 pub(super) const KIMI_SUBAGENTS_DIR_NAME: &str = "subagents";
 pub(super) const KIMI_WIRE_FILE_NAME: &str = "wire.jsonl";
 pub(super) const KIMI_CONFIG_JSON_FILE_NAME: &str = "config.json";
@@ -39,9 +40,11 @@ pub(super) fn paths() -> Result<Vec<PathBuf>> {
     }
 
     if let Some(home) = crate::home::home_dir() {
-        let path = home.join(".kimi");
-        if path.is_dir() && seen.insert(path.clone()) {
-            paths.push(path);
+        for dir in [".kimi", ".kimi-code"] {
+            let path = home.join(dir);
+            if path.is_dir() && seen.insert(path.clone()) {
+                paths.push(path);
+            }
         }
     }
     Ok(paths)
@@ -135,6 +138,15 @@ fn nested_stream_id(parts: &[String]) -> Option<String> {
     if parts.is_empty() {
         return Some(MAIN_STREAM_ID.to_string());
     }
+    if let [directory, agent_id] = parts
+        && directory == KIMI_AGENTS_DIR_NAME
+    {
+        let agent_id = agent_id.trim();
+        if agent_id.is_empty() {
+            return None;
+        }
+        return Some(format!("agent:{agent_id}"));
+    }
     if parts.len() % 2 != 0 {
         return None;
     }
@@ -186,5 +198,29 @@ mod tests {
                 fixture.path("sessions/group/session/wire.jsonl")
             ]
         );
+    }
+
+    #[test]
+    fn discovers_both_old_and_new_layouts_and_skips_non_wire_files() {
+        let fixture = fs_fixture!({
+            "sessions/ws/session-c/agents/agent-1/wire.jsonl": "{}\n",
+            "sessions/ws/session-c/agents/agent-1/other.jsonl": "{}\n",
+            "sessions/ws/session-c/not-agents/agent-1/wire.jsonl": "{}\n",
+            "sessions/group/session-d/wire.jsonl": "{}\n",
+        });
+        let _cleanup = EnvVarGuard::set(KIMI_DATA_DIR_ENV, fixture.root());
+        let files = discover_wire_files().unwrap();
+
+        assert_eq!(
+            files,
+            vec![
+                fixture.path("sessions/group/session-d/wire.jsonl"),
+                fixture.path("sessions/ws/session-c/agents/agent-1/wire.jsonl"),
+            ]
+        );
+
+        let context = wire_context_from_path(&files[1]).unwrap();
+        assert_eq!(context.session_id, "session-c");
+        assert_eq!(context.stream_id, "agent:agent-1");
     }
 }

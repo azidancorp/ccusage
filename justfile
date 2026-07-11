@@ -68,8 +68,3 @@ update-models-dev-pricing:
     nix flake update models-dev
     just gen-models-dev-pricing
     just check
-
-# Bump every package version (Rust included via bump.config.ts), then commit, tag, push
-release: ccusage::typecheck ccusage::build
-    pnpm bumpp -r
-    git checkout -- $(git ls-files '*package.json')
