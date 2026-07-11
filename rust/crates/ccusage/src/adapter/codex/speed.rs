@@ -8,8 +8,11 @@ const CODEX_FAST_COST_MULTIPLIER_LATEST_END_MILLIS: i64 = 1_783_674_380_097; // 
 pub(crate) fn resolve_codex_speed_for_timestamp(
     requested: CodexSpeed,
     timestamp: crate::TimestampMs,
+    recorded_fast_tier: Option<bool>,
 ) -> CodexSpeed {
     match requested {
+        CodexSpeed::Auto if recorded_fast_tier == Some(true) => CodexSpeed::Fast,
+        CodexSpeed::Auto if recorded_fast_tier == Some(false) => CodexSpeed::Standard,
         CodexSpeed::Auto if is_codex_fast_window(timestamp) => CodexSpeed::Fast,
         CodexSpeed::Auto => CodexSpeed::Standard,
         speed => speed,
@@ -38,28 +41,50 @@ mod tests {
         let latest_cutoff = crate::parse_ts_timestamp("2026-07-10T09:06:20.097Z").unwrap();
 
         assert_eq!(
-            resolve_codex_speed_for_timestamp(CodexSpeed::Auto, before_gap),
+            resolve_codex_speed_for_timestamp(CodexSpeed::Auto, before_gap, None),
             CodexSpeed::Fast
         );
         assert_eq!(
-            resolve_codex_speed_for_timestamp(CodexSpeed::Auto, gap_start),
+            resolve_codex_speed_for_timestamp(CodexSpeed::Auto, gap_start, None),
             CodexSpeed::Standard
         );
         assert_eq!(
-            resolve_codex_speed_for_timestamp(CodexSpeed::Auto, restart),
+            resolve_codex_speed_for_timestamp(CodexSpeed::Auto, restart, None),
             CodexSpeed::Fast
         );
         assert_eq!(
-            resolve_codex_speed_for_timestamp(CodexSpeed::Auto, before_latest_cutoff),
+            resolve_codex_speed_for_timestamp(CodexSpeed::Auto, before_latest_cutoff, None),
             CodexSpeed::Fast
         );
         assert_eq!(
-            resolve_codex_speed_for_timestamp(CodexSpeed::Auto, latest_cutoff),
+            resolve_codex_speed_for_timestamp(CodexSpeed::Auto, latest_cutoff, None),
             CodexSpeed::Standard
         );
         assert_eq!(
-            resolve_codex_speed_for_timestamp(CodexSpeed::Standard, restart),
+            resolve_codex_speed_for_timestamp(CodexSpeed::Standard, restart, None),
             CodexSpeed::Standard
+        );
+    }
+
+    #[test]
+    fn recorded_thread_tier_only_changes_auto_speed() {
+        let timestamp = crate::parse_ts_timestamp("2026-07-10T22:22:47.188Z").unwrap();
+
+        assert_eq!(
+            resolve_codex_speed_for_timestamp(CodexSpeed::Auto, timestamp, Some(true)),
+            CodexSpeed::Fast
+        );
+        assert_eq!(
+            resolve_codex_speed_for_timestamp(CodexSpeed::Auto, timestamp, Some(false)),
+            CodexSpeed::Standard
+        );
+        assert_eq!(
+            resolve_codex_speed_for_timestamp(CodexSpeed::Standard, timestamp, Some(true)),
+            CodexSpeed::Standard
+        );
+        assert_eq!(
+            resolve_codex_speed_for_timestamp(CodexSpeed::Fast, timestamp, Some(false)),
+            CodexSpeed::Fast
         );
     }
 }

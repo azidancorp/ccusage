@@ -23,8 +23,12 @@ use super::{loader, parser, paths, report::calculate_codex_event_cost};
 type CodexEventKey = (u64, usize, i64, u64, usize, u64, u64, u64, u64, u64);
 type CodexDedupeShards = [Mutex<FxHashSet<CodexEventKey>>];
 
+const CODEX_GROUPS_CACHE_DISCRIMINATOR: &str = "codex-groups-v3";
+const CODEX_COST_POLICY_VERSION: &str = "recorded-thread-tier-v1";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedCodexGroups {
+    cost_policy: String,
     file_states: BTreeMap<String, FileState>,
     parser_states: BTreeMap<String, CachedCodexParserState>,
     complete_lines: BTreeMap<String, bool>,
@@ -37,6 +41,8 @@ struct CachedCodexParserState {
     previous_totals: Option<crate::CodexRawUsage>,
     current_model: Option<String>,
     current_model_is_fallback: bool,
+    current_recorded_fast_tier: Option<bool>,
+    pending_recorded_fast_tier: Option<bool>,
 }
 
 impl From<parser::CodexParserState> for CachedCodexParserState {
@@ -45,6 +51,8 @@ impl From<parser::CodexParserState> for CachedCodexParserState {
             previous_totals: state.previous_totals,
             current_model: state.current_model,
             current_model_is_fallback: state.current_model_is_fallback,
+            current_recorded_fast_tier: state.current_recorded_fast_tier,
+            pending_recorded_fast_tier: state.pending_recorded_fast_tier,
         }
     }
 }
@@ -55,6 +63,8 @@ impl From<CachedCodexParserState> for parser::CodexParserState {
             previous_totals: state.previous_totals,
             current_model: state.current_model,
             current_model_is_fallback: state.current_model_is_fallback,
+            current_recorded_fast_tier: state.current_recorded_fast_tier,
+            pending_recorded_fast_tier: state.pending_recorded_fast_tier,
         }
     }
 }
@@ -68,42 +78,59 @@ pub(crate) fn load_groups(
     let sources = paths::codex_usage_sources()?;
     let files = source_files_from_sources(&sources);
     let file_states = file_states_for_files(&files);
-    let signature =
-        crate::adapter::cache::create_file_state_signature(&files, &[format!("speed={speed:?}")]);
-    if let Some((cached_signature, cached)) = crate::adapter::cache::read_source_value_cache_entry::<
-        CachedCodexGroups,
-    >("codex", kind, shared, "codex-groups-v2")
-    {
-        if cached_signature == signature {
-            return Ok(cached.groups);
-        }
-        if let Some(updated) = update_cached_groups_for_appends(
-            cached,
-            &sources,
-            &file_states,
-            shared,
+    let cost_policy = codex_cost_policy_key(speed);
+    let signature = crate::adapter::cache::create_file_state_signature(
+        &files,
+        std::slice::from_ref(&cost_policy),
+    );
+    if let Some((cached_signature, cached)) =
+        crate::adapter::cache::read_source_value_cache_entry::<CachedCodexGroups>(
+            "codex",
             kind,
-            pricing,
-            speed,
-        )? {
-            crate::adapter::cache::write_source_value_cache_entry(
-                "codex",
-                kind,
+            shared,
+            CODEX_GROUPS_CACHE_DISCRIMINATOR,
+        )
+    {
+        if cached.cost_policy == cost_policy {
+            if cached_signature == signature {
+                return Ok(cached.groups);
+            }
+            if let Some(updated) = update_cached_groups_for_appends(
+                cached,
+                &sources,
+                &file_states,
                 shared,
-                "codex-groups-v2",
-                &signature,
-                &updated,
-            );
-            return Ok(updated.groups);
+                kind,
+                pricing,
+                speed,
+            )? {
+                crate::adapter::cache::write_source_value_cache_entry(
+                    "codex",
+                    kind,
+                    shared,
+                    CODEX_GROUPS_CACHE_DISCRIMINATOR,
+                    &signature,
+                    &updated,
+                );
+                return Ok(updated.groups);
+            }
         }
     }
 
-    let loaded = load_groups_cache_value(&sources, file_states, shared, kind, pricing, speed)?;
+    let loaded = load_groups_cache_value(
+        &sources,
+        file_states,
+        shared,
+        kind,
+        pricing,
+        speed,
+        cost_policy,
+    )?;
     crate::adapter::cache::write_source_value_cache_entry(
         "codex",
         kind,
         shared,
-        "codex-groups-v2",
+        CODEX_GROUPS_CACHE_DISCRIMINATOR,
         &signature,
         &loaded,
     );
@@ -130,6 +157,7 @@ fn load_groups_cache_value(
     kind: AgentReportKind,
     pricing: &PricingMap,
     speed: CodexSpeed,
+    cost_policy: String,
 ) -> Result<CachedCodexGroups> {
     let (groups, seen) = load_groups_uncached_with_seen(sources, shared, kind, pricing, speed)?;
     let parser_states = parser_states_for_recent_files(sources, &file_states, 8)?;
@@ -141,12 +169,17 @@ fn load_groups_cache_value(
         })
         .collect();
     Ok(CachedCodexGroups {
+        cost_policy,
         file_states,
         parser_states,
         complete_lines,
         seen,
         groups,
     })
+}
+
+pub(crate) fn codex_cost_policy_key(speed: CodexSpeed) -> String {
+    format!("policy={CODEX_COST_POLICY_VERSION};speed={speed:?}")
 }
 
 fn update_cached_groups_for_appends(
@@ -703,6 +736,82 @@ mod tests {
         adapter::codex::paths::CodexUsageSource, model_aliases::set_model_aliases_for_tests,
     };
 
+    fn speed_test_pricing() -> PricingMap {
+        let mut pricing = PricingMap::default();
+        pricing.load_json(
+            r#"{
+                "gpt-test": {
+                    "input_cost_per_token": 1.0,
+                    "output_cost_per_token": 0.0,
+                    "cache_read_input_token_cost": 0.0,
+                    "provider_specific_entry": { "fast": 2.0 }
+                }
+            }"#,
+        );
+        pricing
+    }
+
+    #[test]
+    fn recorded_priority_prices_the_next_turn_as_fast() {
+        let fixture = fs_fixture!({
+            "sessions/root.jsonl": [
+                json!({
+                    "timestamp": "2026-07-10T22:22:38.959Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "thread_settings_applied",
+                        "thread_settings": {
+                            "service_tier": "priority",
+                        },
+                    },
+                })
+                .to_string(),
+                json!({
+                    "timestamp": "2026-07-10T22:22:39.013Z",
+                    "type": "turn_context",
+                    "payload": {
+                        "model": "gpt-test",
+                    },
+                })
+                .to_string(),
+                json!({
+                    "timestamp": "2026-07-10T22:22:47.188Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 1,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "reasoning_output_tokens": 0,
+                                "total_tokens": 1,
+                            },
+                        },
+                    },
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        });
+        let shared = SharedArgs {
+            timezone: Some("UTC".to_string()),
+            ..SharedArgs::default()
+        };
+        let pricing = speed_test_pricing();
+
+        let groups = load_groups_from_directory(
+            &fixture.path("sessions"),
+            &shared,
+            AgentReportKind::Daily,
+            &pricing,
+            CodexSpeed::Auto,
+        )
+        .unwrap();
+
+        assert_eq!(groups["2026-07-10"].cost, Some(2.0));
+    }
+
     #[test]
     fn same_size_rewrite_rebuilds_codex_groups() {
         let usage_line = |input_tokens: u64| {
@@ -768,6 +877,312 @@ mod tests {
 
         assert_eq!(first["2026-07-09"].input_tokens, 100);
         assert_eq!(second["2026-07-09"].input_tokens, 200);
+    }
+
+    #[test]
+    fn changing_requested_speed_rebuilds_cached_groups() {
+        let usage_line = json!({
+            "timestamp": "2026-07-10T22:22:47.188Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "model": "gpt-test",
+                    "last_token_usage": {
+                        "input_tokens": 1,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 0,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": 1,
+                    },
+                },
+            },
+        })
+        .to_string();
+        let fixture = fs_fixture!({
+            "codex/sessions/session.jsonl": usage_line,
+        });
+        let cache = Fixture::new();
+        let _env = EnvVarsGuard::set_many([
+            ("CODEX_HOME", Some(fixture.path("codex").into_os_string())),
+            (
+                "XDG_CACHE_HOME",
+                Some(cache.root().as_os_str().to_os_string()),
+            ),
+        ]);
+        let shared = SharedArgs {
+            json: true,
+            offline: true,
+            timezone: Some("UTC".to_string()),
+            ..SharedArgs::default()
+        };
+        let pricing = speed_test_pricing();
+
+        let standard = load_groups(
+            &shared,
+            AgentReportKind::Daily,
+            &pricing,
+            CodexSpeed::Standard,
+        )
+        .unwrap();
+        let fast =
+            load_groups(&shared, AgentReportKind::Daily, &pricing, CodexSpeed::Fast).unwrap();
+
+        assert_eq!(standard["2026-07-10"].cost, Some(1.0));
+        assert_eq!(fast["2026-07-10"].cost, Some(2.0));
+    }
+
+    #[test]
+    fn append_cache_keeps_recorded_priority_for_later_usage() {
+        let settings_line = json!({
+            "timestamp": "2026-07-10T22:22:38.959Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "thread_settings_applied",
+                "thread_settings": {
+                    "service_tier": "priority",
+                },
+            },
+        })
+        .to_string();
+        let context_line = json!({
+            "timestamp": "2026-07-10T22:22:39.013Z",
+            "type": "turn_context",
+            "payload": {
+                "model": "gpt-test",
+            },
+        })
+        .to_string();
+        let usage_line = |timestamp: &str| {
+            json!({
+                "timestamp": timestamp,
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {
+                            "input_tokens": 1,
+                            "cached_input_tokens": 0,
+                            "output_tokens": 0,
+                            "reasoning_output_tokens": 0,
+                            "total_tokens": 1,
+                        },
+                    },
+                },
+            })
+            .to_string()
+        };
+        let first_usage = usage_line("2026-07-10T22:22:47.188Z");
+        let appended_usage = usage_line("2026-07-10T22:23:47.188Z");
+        let initial = format!("{settings_line}\n{context_line}\n{first_usage}\n");
+        let fixture = fs_fixture!({
+            "codex/sessions/session.jsonl": &initial,
+        });
+        let cache = Fixture::new();
+        let _env = EnvVarsGuard::set_many([
+            ("CODEX_HOME", Some(fixture.path("codex").into_os_string())),
+            (
+                "XDG_CACHE_HOME",
+                Some(cache.root().as_os_str().to_os_string()),
+            ),
+        ]);
+        let shared = SharedArgs {
+            json: true,
+            offline: true,
+            timezone: Some("UTC".to_string()),
+            ..SharedArgs::default()
+        };
+        let pricing = speed_test_pricing();
+
+        let first =
+            load_groups(&shared, AgentReportKind::Daily, &pricing, CodexSpeed::Auto).unwrap();
+        std::fs::write(
+            fixture.path("codex/sessions/session.jsonl"),
+            format!("{initial}{appended_usage}\n"),
+        )
+        .unwrap();
+        let appended =
+            load_groups(&shared, AgentReportKind::Daily, &pricing, CodexSpeed::Auto).unwrap();
+
+        assert_eq!(first["2026-07-10"].cost, Some(2.0));
+        assert_eq!(appended["2026-07-10"].cost, Some(4.0));
+    }
+
+    #[test]
+    fn recorded_default_overrides_a_historical_fast_window() {
+        let fixture = fs_fixture!({
+            "sessions/root.jsonl": [
+                json!({
+                    "timestamp": "2026-05-15T08:00:00.000Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "thread_settings_applied",
+                        "thread_settings": {
+                            "service_tier": "default",
+                        },
+                    },
+                })
+                .to_string(),
+                json!({
+                    "timestamp": "2026-05-15T08:00:01.000Z",
+                    "type": "turn_context",
+                    "payload": {
+                        "model": "gpt-test",
+                    },
+                })
+                .to_string(),
+                json!({
+                    "timestamp": "2026-05-15T08:00:02.000Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 1,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "reasoning_output_tokens": 0,
+                                "total_tokens": 1,
+                            },
+                        },
+                    },
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        });
+        let shared = SharedArgs {
+            timezone: Some("UTC".to_string()),
+            ..SharedArgs::default()
+        };
+        let pricing = speed_test_pricing();
+
+        let groups = load_groups_from_directory(
+            &fixture.path("sessions"),
+            &shared,
+            AgentReportKind::Daily,
+            &pricing,
+            CodexSpeed::Auto,
+        )
+        .unwrap();
+
+        assert_eq!(groups["2026-05-15"].cost, Some(1.0));
+    }
+
+    #[test]
+    fn codex_v144_disables_historical_cutoffs_without_a_recorded_tier() {
+        let fixture = fs_fixture!({
+            "sessions/root.jsonl": [
+                json!({
+                    "timestamp": "2026-07-10T09:05:14.226Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "cli_version": "0.144.1",
+                    },
+                })
+                .to_string(),
+                json!({
+                    "timestamp": "2026-07-10T09:05:15.000Z",
+                    "type": "turn_context",
+                    "payload": {
+                        "model": "gpt-test",
+                    },
+                })
+                .to_string(),
+                json!({
+                    "timestamp": "2026-07-10T09:05:20.000Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 1,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "reasoning_output_tokens": 0,
+                                "total_tokens": 1,
+                            },
+                        },
+                    },
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        });
+        let shared = SharedArgs {
+            timezone: Some("UTC".to_string()),
+            ..SharedArgs::default()
+        };
+        let pricing = speed_test_pricing();
+
+        let groups = load_groups_from_directory(
+            &fixture.path("sessions"),
+            &shared,
+            AgentReportKind::Daily,
+            &pricing,
+            CodexSpeed::Auto,
+        )
+        .unwrap();
+
+        assert_eq!(groups["2026-07-10"].cost, Some(1.0));
+    }
+
+    #[test]
+    fn pre_v144_logs_without_recorded_tier_use_historical_cutoffs() {
+        let fixture = fs_fixture!({
+            "sessions/root.jsonl": [
+                json!({
+                    "timestamp": "2026-07-10T09:01:26.104Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "cli_version": "0.143.0",
+                    },
+                })
+                .to_string(),
+                json!({
+                    "timestamp": "2026-07-10T09:01:27.000Z",
+                    "type": "turn_context",
+                    "payload": {
+                        "model": "gpt-test",
+                    },
+                })
+                .to_string(),
+                json!({
+                    "timestamp": "2026-07-10T09:01:28.000Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 1,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "reasoning_output_tokens": 0,
+                                "total_tokens": 1,
+                            },
+                        },
+                    },
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        });
+        let shared = SharedArgs {
+            timezone: Some("UTC".to_string()),
+            ..SharedArgs::default()
+        };
+        let pricing = speed_test_pricing();
+
+        let groups = load_groups_from_directory(
+            &fixture.path("sessions"),
+            &shared,
+            AgentReportKind::Daily,
+            &pricing,
+            CodexSpeed::Auto,
+        )
+        .unwrap();
+
+        assert_eq!(groups["2026-07-10"].cost, Some(2.0));
     }
 
     #[test]

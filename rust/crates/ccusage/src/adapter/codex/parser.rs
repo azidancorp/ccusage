@@ -21,8 +21,12 @@ static EVENT_MSG_TYPE_FINDER: LazyLock<Finder<'static>> =
     LazyLock::new(|| Finder::new(br#""type":"event_msg""#));
 static TURN_CONTEXT_TYPE_FINDER: LazyLock<Finder<'static>> =
     LazyLock::new(|| Finder::new(br#""type":"turn_context""#));
+static SESSION_META_TYPE_FINDER: LazyLock<Finder<'static>> =
+    LazyLock::new(|| Finder::new(br#""type":"session_meta""#));
 static TOKEN_COUNT_TYPE_FINDER: LazyLock<Finder<'static>> =
     LazyLock::new(|| Finder::new(br#""type":"token_count""#));
+static THREAD_SETTINGS_APPLIED_TYPE_FINDER: LazyLock<Finder<'static>> =
+    LazyLock::new(|| Finder::new(br#""type":"thread_settings_applied""#));
 static COMPACT_TYPE_FIELD_FINDER: LazyLock<Finder<'static>> =
     LazyLock::new(|| Finder::new(br#""type":"#));
 static TYPE_KEY_FINDER: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new(br#""type""#));
@@ -65,6 +69,8 @@ pub(super) struct CodexParserState {
     pub(super) previous_totals: Option<CodexRawUsage>,
     pub(super) current_model: Option<String>,
     pub(super) current_model_is_fallback: bool,
+    pub(super) current_recorded_fast_tier: Option<bool>,
+    pub(super) pending_recorded_fast_tier: Option<bool>,
 }
 
 pub(super) fn visit_codex_session_file(
@@ -116,6 +122,8 @@ pub(super) fn visit_codex_session_file_from_offset(
                     &mut state.previous_totals,
                     &mut state.current_model,
                     &mut state.current_model_is_fallback,
+                    &mut state.current_recorded_fast_tier,
+                    &mut state.pending_recorded_fast_tier,
                     &mut visit,
                 )?;
             }
@@ -152,10 +160,26 @@ fn visit_codex_session_entry(
     previous_totals: &mut Option<CodexRawUsage>,
     current_model: &mut Option<String>,
     current_model_is_fallback: &mut bool,
+    current_recorded_fast_tier: &mut Option<bool>,
+    pending_recorded_fast_tier: &mut Option<bool>,
     visit: &mut impl FnMut(CodexTokenUsageEvent) -> Result<()>,
 ) -> Result<()> {
     let entry_type = value.entry_type.as_deref();
+    if entry_type == Some("session_meta") {
+        if value
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.cli_version.as_deref())
+            .is_some_and(codex_cli_persists_thread_settings)
+        {
+            current_recorded_fast_tier.get_or_insert(false);
+        }
+        return Ok(());
+    }
     if entry_type == Some("turn_context") {
+        if let Some(recorded_fast_tier) = pending_recorded_fast_tier.take() {
+            *current_recorded_fast_tier = Some(recorded_fast_tier);
+        }
         if let Some(model) = value.payload.as_ref().and_then(codex_model_from_payload) {
             *current_model = Some(model);
             *current_model_is_fallback = false;
@@ -171,6 +195,16 @@ fn visit_codex_session_entry(
     let Some(payload) = value.payload.as_ref() else {
         return Ok(());
     };
+    if payload.payload_type.as_deref() == Some("thread_settings_applied") {
+        *pending_recorded_fast_tier = Some(
+            payload
+                .thread_settings
+                .as_ref()
+                .and_then(|settings| settings.service_tier.as_deref())
+                .is_some_and(|tier| matches!(tier, "priority" | "fast")),
+        );
+        return Ok(());
+    }
     if payload.payload_type.as_deref() != Some("token_count") {
         return Ok(());
     }
@@ -216,6 +250,7 @@ fn visit_codex_session_entry(
         reasoning_output_tokens: raw_usage.reasoning_output_tokens,
         total_tokens: raw_usage.total_tokens,
         is_fallback_model,
+        recorded_fast_tier: *current_recorded_fast_tier,
     })
 }
 
@@ -304,13 +339,20 @@ fn visit_codex_exec_usage_event(
         reasoning_output_tokens: raw_usage.reasoning_output_tokens,
         total_tokens: raw_usage.total_tokens,
         is_fallback_model,
+        recorded_fast_tier: None,
     })
 }
 
 fn codex_line_usage_kind(line: &[u8]) -> Option<CodexLineKind> {
     let has_event_msg = EVENT_MSG_TYPE_FINDER.find(line).is_some();
     let has_token_count = has_event_msg && TOKEN_COUNT_TYPE_FINDER.find(line).is_some();
-    if TURN_CONTEXT_TYPE_FINDER.find(line).is_some() || has_token_count {
+    let has_thread_settings =
+        has_event_msg && THREAD_SETTINGS_APPLIED_TYPE_FINDER.find(line).is_some();
+    if SESSION_META_TYPE_FINDER.find(line).is_some()
+        || TURN_CONTEXT_TYPE_FINDER.find(line).is_some()
+        || has_token_count
+        || has_thread_settings
+    {
         return Some(CodexLineKind::Session);
     }
     let has_compact_type = COMPACT_TYPE_FIELD_FINDER.find(line).is_some();
@@ -319,8 +361,17 @@ fn codex_line_usage_kind(line: &[u8]) -> Option<CodexLineKind> {
         && line.len() < 64 * 1024
         && TOKEN_COUNT_TYPE_FINDER.find(line).is_some();
     if has_event_msg || has_nested_token_count || !has_compact_type {
-        let (has_turn_context, has_event_msg, has_token_count) = codex_line_type_flags(line);
-        if has_turn_context || (has_event_msg && has_token_count) {
+        let (
+            has_session_meta,
+            has_turn_context,
+            has_event_msg,
+            has_token_count,
+            has_thread_settings,
+        ) = codex_line_type_flags(line);
+        if has_session_meta
+            || has_turn_context
+            || (has_event_msg && (has_token_count || has_thread_settings))
+        {
             return Some(CodexLineKind::Session);
         }
     }
@@ -333,11 +384,13 @@ fn codex_line_usage_kind(line: &[u8]) -> Option<CodexLineKind> {
     None
 }
 
-fn codex_line_type_flags(line: &[u8]) -> (bool, bool, bool) {
+fn codex_line_type_flags(line: &[u8]) -> (bool, bool, bool, bool, bool) {
     let mut start = 0;
+    let mut has_session_meta = false;
     let mut has_turn_context = false;
     let mut has_event_msg = false;
     let mut has_token_count = false;
+    let mut has_thread_settings = false;
     while let Some(index) = TYPE_KEY_FINDER.find(&line[start..]) {
         let key_start = start + index;
         let mut cursor = skip_json_whitespace(line, key_start + br#""type""#.len());
@@ -351,15 +404,52 @@ fn codex_line_type_flags(line: &[u8]) -> (bool, bool, bool) {
             continue;
         }
         cursor += 1;
+        has_session_meta |= json_string_value_matches(line, cursor, b"session_meta");
         has_turn_context |= json_string_value_matches(line, cursor, b"turn_context");
         has_event_msg |= json_string_value_matches(line, cursor, b"event_msg");
         has_token_count |= json_string_value_matches(line, cursor, b"token_count");
-        if has_turn_context || (has_event_msg && has_token_count) {
-            return (has_turn_context, has_event_msg, has_token_count);
+        has_thread_settings |= json_string_value_matches(line, cursor, b"thread_settings_applied");
+        if has_session_meta
+            || has_turn_context
+            || (has_event_msg && (has_token_count || has_thread_settings))
+        {
+            return (
+                has_session_meta,
+                has_turn_context,
+                has_event_msg,
+                has_token_count,
+                has_thread_settings,
+            );
         }
         start = cursor.saturating_add(1);
     }
-    (has_turn_context, has_event_msg, has_token_count)
+    (
+        has_session_meta,
+        has_turn_context,
+        has_event_msg,
+        has_token_count,
+        has_thread_settings,
+    )
+}
+
+fn codex_cli_persists_thread_settings(version: &str) -> bool {
+    let mut parts = version.trim().trim_start_matches('v').split('.');
+    let Some(major) = parts.next().and_then(parse_version_component) else {
+        return false;
+    };
+    let Some(minor) = parts.next().and_then(parse_version_component) else {
+        return false;
+    };
+    major > 0 || minor >= 144
+}
+
+fn parse_version_component(value: &str) -> Option<u64> {
+    let len = value.bytes().take_while(u8::is_ascii_digit).count();
+    value
+        .get(..len)
+        .filter(|digits| !digits.is_empty())?
+        .parse()
+        .ok()
 }
 
 fn json_string_value_matches(line: &[u8], start: usize, value: &[u8]) -> bool {
@@ -891,6 +981,71 @@ fn subtract_codex_raw_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use ccusage_test_support::fs_fixture;
+
+    #[test]
+    fn recognizes_the_durable_thread_settings_release_boundary() {
+        assert!(!codex_cli_persists_thread_settings("0.143.0"));
+        assert!(codex_cli_persists_thread_settings("0.144.0"));
+        assert!(codex_cli_persists_thread_settings("v0.144.1"));
+        assert!(codex_cli_persists_thread_settings("1.0.0"));
+        assert!(!codex_cli_persists_thread_settings("invalid"));
+    }
+
+    #[test]
+    fn parses_recorded_thread_tier_with_json_whitespace() {
+        let fixture = fs_fixture!({
+            "sessions/root.jsonl": [
+                r#"{ "timestamp": "2026-07-10T22:22:38.959Z", "type" : "event_msg", "payload": { "type" : "thread_settings_applied", "thread_settings": { "service_tier": "priority" } } }"#,
+                r#"{"timestamp":"2026-07-10T22:22:39.013Z","type":"turn_context","payload":{"model":"gpt-test"}}"#,
+                r#"{"timestamp":"2026-07-10T22:22:47.188Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":1}}}}"#,
+            ]
+            .join("\n"),
+        });
+        let mut events = Vec::new();
+
+        visit_codex_session_file(
+            &fixture.path("sessions"),
+            &fixture.path("sessions/root.jsonl"),
+            |event| {
+                events.push(event);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].recorded_fast_tier, Some(true));
+    }
+
+    #[test]
+    fn thread_tier_change_waits_for_the_next_turn_context() {
+        let fixture = fs_fixture!({
+            "sessions/root.jsonl": [
+                r#"{"timestamp":"2026-07-10T22:22:38.959Z","type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"service_tier":"priority"}}}"#,
+                r#"{"timestamp":"2026-07-10T22:22:39.000Z","type":"event_msg","payload":{"type":"token_count","info":{"model":"gpt-test","last_token_usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":1}}}}"#,
+                r#"{"timestamp":"2026-07-10T22:22:39.013Z","type":"turn_context","payload":{"model":"gpt-test"}}"#,
+                r#"{"timestamp":"2026-07-10T22:22:47.188Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":1}}}}"#,
+            ]
+            .join("\n"),
+        });
+        let mut events = Vec::new();
+
+        visit_codex_session_file(
+            &fixture.path("sessions"),
+            &fixture.path("sessions/root.jsonl"),
+            |event| {
+                events.push(event);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].recorded_fast_tier, None);
+        assert_eq!(events[1].recorded_fast_tier, Some(true));
+    }
 
     #[test]
     fn loads_codex_auto_review_fallbacks_from_models_dev_snapshot() {

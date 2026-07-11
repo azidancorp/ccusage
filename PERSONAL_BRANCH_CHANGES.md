@@ -10,6 +10,15 @@ upstream merges.
   and `ccusage opencode` reports.
 - Keep Codex per-file event caching and grouped-report caching wired into
   `ccusage codex` and all-agent Codex loading.
+- Keep Codex `--speed auto` pricing based on recorded per-thread service-tier
+  events for Codex CLI v0.144+ logs. Recorded `priority` and legacy `fast` are
+  fast; recorded `default`, `flex`, missing, or unknown tiers are standard.
+  Apply a recorded tier from the next `turn_context` only.
+- Keep the personal historical fast-mode cutoff windows only for older Codex
+  logs that do not have v0.144+ recorded thread-tier metadata.
+- When Codex speed-pricing semantics change, bump the Codex event/group cache
+  discriminators or cost-policy key so cached costs are not reused across
+  incompatible rules.
 - Cache files live under `$XDG_CACHE_HOME/ccusage/usage-rust`, or
   `~/.cache/ccusage/usage-rust` when `XDG_CACHE_HOME` is unset.
 - Cache invalidation must include source file metadata plus cost-affecting

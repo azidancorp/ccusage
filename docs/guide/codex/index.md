@@ -48,7 +48,7 @@ These views support `--json`, `--compact`, `--offline`, and `--speed auto|standa
 - **Token deltas** – Each `event_msg` with `payload.type === "token_count"` reports cumulative totals. The CLI subtracts the previous totals to recover per-turn token usage (input, cached input, output, reasoning, total).
 - **Per-model grouping** – The `turn_context` metadata specifies the active model. We aggregate tokens per day/month and per model. Sessions lacking model metadata (seen in early September 2025 builds) are skipped.
 - **Pricing** – Rates come from LiteLLM's pricing dataset via the shared `LiteLLMPricingFetcher`. Codex's internal review label is resolved to the newest known model for the log date before pricing is calculated.
-- **Speed pricing** – `--speed auto` is the default. It reads `config.toml` from each `CODEX_HOME` root and applies fast pricing when any Codex config has `service_tier = "priority"` or legacy `service_tier = "fast"` configured. Fast mode uses the model-specific LiteLLM multiplier when available and otherwise falls back to 2x pricing. Pass `--speed fast` or `--speed standard` to override config-based detection.
+- **Speed pricing** – `--speed auto` is the default. For Codex CLI v0.144+ logs, ccusage uses recorded `thread_settings_applied` service-tier snapshots: `priority` and legacy `fast` price as fast mode, while `default`, `flex`, missing, or unknown recorded tiers price as standard mode. Older logs without recorded thread tiers use the historical local fast-mode fallback. Fast mode uses the model-specific LiteLLM multiplier when available and otherwise falls back to 2x pricing. Pass `--speed fast` or `--speed standard` to override automatic detection.
 - **Legacy fallback** – Early September 2025 logs that never recorded `turn_context` metadata are still included; the CLI assumes `gpt-5` for pricing so you can review the tokens even though the model tag is missing (the JSON output also marks these rows with `"isFallback": true`).
 - **Cost formula** – Non-cached input uses the standard input price; cached input uses the cache-read price (falling back to the input price when missing); and output tokens are billed at the output price. All prices are per million tokens. Reasoning tokens may be shown for reference, but they are part of the output charge and are not billed separately.
 - **Totals and reports** – Daily, monthly, and session views display per-model breakdowns, overall totals, and optional JSON for automation.
@@ -64,10 +64,12 @@ When Codex emits a model alias, the CLI automatically resolves it through the Li
 
 ## Speed Pricing
 
-Codex logs usually do not include whether a turn used fast mode. By default, `ccusage codex` uses `--speed auto`, reads `config.toml` from each `CODEX_HOME` root, and treats `service_tier = "priority"` or legacy `service_tier = "fast"` as fast pricing when any configured root opts into it. Fast mode uses the model-specific LiteLLM multiplier when available and otherwise falls back to 2x pricing.
+By default, `ccusage codex` uses `--speed auto`. For Codex CLI v0.144+ session logs, Codex records thread-level service-tier snapshots. ccusage prices turns after the next `turn_context` as fast when the recorded tier is `priority` or legacy `fast`; recorded `default`, `flex`, missing, or unknown tiers price as standard. Older logs without recorded thread tiers keep the historical local fast-mode fallback.
+
+Fast mode uses the model-specific LiteLLM multiplier when available and otherwise falls back to 2x pricing. Use `--speed fast` or `--speed standard` when you want an explicit override for a whole report.
 
 ```bash
-# Default: read Codex config.toml
+# Default: recorded thread tiers when available
 ccusage codex daily --speed auto
 
 # Force fast pricing

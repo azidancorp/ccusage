@@ -10,7 +10,7 @@ use crate::{PricingMap, Result, cli::AgentCommandArgs, log_level, print_json_or_
 
 #[cfg(test)]
 pub(crate) use aggregate::aggregate_events;
-pub(crate) use aggregate::load_groups;
+pub(crate) use aggregate::{codex_cost_policy_key, load_groups};
 #[cfg(test)]
 pub(crate) use loader::load_codex_events_from_directory;
 pub(crate) use loader::source_files;
@@ -146,6 +146,7 @@ mod tests {
                 reasoning_output_tokens: 0,
                 total_tokens: 105,
                 is_fallback_model: false,
+                recorded_fast_tier: None,
             }],
             AgentReportKind::Daily,
             Some("UTC"),
@@ -189,6 +190,7 @@ mod tests {
                     reasoning_output_tokens: 0,
                     total_tokens: 105,
                     is_fallback_model: false,
+                    recorded_fast_tier: None,
                 },
                 CodexTokenUsageEvent {
                     session_id: "session-1".to_string(),
@@ -200,6 +202,7 @@ mod tests {
                     reasoning_output_tokens: 0,
                     total_tokens: 53,
                     is_fallback_model: false,
+                    recorded_fast_tier: None,
                 },
             ],
             AgentReportKind::Daily,
@@ -395,6 +398,7 @@ mod tests {
             reasoning_output_tokens: 0,
             total_tokens: 1,
             is_fallback_model: false,
+            recorded_fast_tier: None,
         })
         .collect::<Vec<_>>();
 
@@ -439,6 +443,7 @@ mod tests {
                 reasoning_output_tokens: 0,
                 total_tokens: 300_000,
                 is_fallback_model: false,
+                recorded_fast_tier: None,
             })
             .collect::<Vec<_>>();
 
@@ -523,6 +528,7 @@ mod tests {
                 reasoning_output_tokens: 2,
                 total_tokens: 147,
                 is_fallback_model: false,
+                recorded_fast_tier: None,
             },
             CodexTokenUsageEvent {
                 session_id: "/workspace/api/session-a.jsonl".to_string(),
@@ -534,6 +540,7 @@ mod tests {
                 reasoning_output_tokens: 0,
                 total_tokens: 80,
                 is_fallback_model: true,
+                recorded_fast_tier: None,
             },
             CodexTokenUsageEvent {
                 session_id: "/workspace/web/session-b.jsonl".to_string(),
@@ -545,6 +552,7 @@ mod tests {
                 reasoning_output_tokens: 0,
                 total_tokens: 12,
                 is_fallback_model: false,
+                recorded_fast_tier: None,
             },
             CodexTokenUsageEvent {
                 session_id: "ignored-missing-model".to_string(),
@@ -556,6 +564,7 @@ mod tests {
                 reasoning_output_tokens: 0,
                 total_tokens: 1_998,
                 is_fallback_model: false,
+                recorded_fast_tier: None,
             },
         ];
 

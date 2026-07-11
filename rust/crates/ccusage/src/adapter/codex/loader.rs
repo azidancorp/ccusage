@@ -17,6 +17,8 @@ use super::{
     paths::{codex_usage_sources, collect_codex_usage_files, collect_deduped_codex_usage_files},
 };
 
+const CODEX_EVENTS_CACHE_DISCRIMINATOR: &str = "codex-events-v4";
+
 #[cfg(test)]
 pub(crate) fn load_codex_events_from_directory(
     sessions_dir: &Path,
@@ -70,7 +72,7 @@ pub(super) fn load_codex_events_for_files(
     if single_thread {
         crate::adapter::cache::load_file_rows_with_cache(
             "codex",
-            "codex-events-v3",
+            CODEX_EVENTS_CACHE_DISCRIMINATOR,
             files,
             |misses| {
                 misses
@@ -82,7 +84,7 @@ pub(super) fn load_codex_events_for_files(
     } else {
         crate::adapter::cache::load_file_rows_with_cache(
             "codex",
-            "codex-events-v3",
+            CODEX_EVENTS_CACHE_DISCRIMINATOR,
             files,
             |misses| read_codex_session_files_parallel_grouped(sessions_dir, misses),
         )
@@ -173,6 +175,7 @@ mod tests {
             reasoning_output_tokens: 0,
             total_tokens: 150,
             is_fallback_model: false,
+            recorded_fast_tier: None,
         }
     }
 

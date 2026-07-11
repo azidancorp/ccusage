@@ -166,7 +166,7 @@ pub(super) fn calculate_codex_event_cost(
         model,
         &usage,
         pricing,
-        resolve_codex_speed_for_timestamp(speed, timestamp),
+        resolve_codex_speed_for_timestamp(speed, timestamp, event.recorded_fast_tier),
     )
 }
 

@@ -158,7 +158,7 @@ fn load_base_rows(
                     load_kind,
                     &loader_shared,
                     codex::source_files,
-                    Vec::new(),
+                    vec![codex::codex_cost_policy_key(CodexSpeed::Auto)],
                     || load_codex_rows(load_kind, &loader_shared, pricing),
                 )
             }),

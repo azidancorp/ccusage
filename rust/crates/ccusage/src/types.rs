@@ -148,6 +148,8 @@ pub(crate) struct CodexTokenUsageEvent {
     pub(crate) reasoning_output_tokens: u64,
     pub(crate) total_tokens: u64,
     pub(crate) is_fallback_model: bool,
+    #[serde(default)]
+    pub(crate) recorded_fast_tier: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
