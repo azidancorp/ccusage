@@ -125,8 +125,10 @@ impl SimpleTable {
                 }
             })
             .collect::<Vec<_>>();
-        let total_required = cli_table_required_width(&widths);
-        let first_column_min = if self.compact_dates && total_required <= self.terminal_width {
+        let full_date_minimums = minimum_column_widths(&widths, &self.aligns, 12);
+        let first_column_min = if self.compact_dates
+            && cli_table_required_width(&full_date_minimums) <= self.terminal_width
+        {
             12
         } else {
             10
@@ -135,7 +137,7 @@ impl SimpleTable {
     }
 
     fn compact_date_row(&self, row: &[String], widths: &[usize]) -> Vec<String> {
-        if !self.compact_dates || widths.first().copied().unwrap_or_default() > 10 {
+        if !self.compact_dates || widths.first().copied().unwrap_or_default() >= 12 {
             return row.to_vec();
         }
         let mut row = row.to_vec();
@@ -183,21 +185,7 @@ fn fit_widths_to_terminal(
         return widths;
     }
 
-    let minimums = widths
-        .iter()
-        .enumerate()
-        .map(|(index, _)| {
-            if aligns.get(index) == Some(&Align::Right) {
-                10
-            } else if index == 0 {
-                first_column_min
-            } else if index == 1 {
-                12
-            } else {
-                8
-            }
-        })
-        .collect::<Vec<_>>();
+    let minimums = minimum_column_widths(&widths, aligns, first_column_min);
 
     let available_width = terminal_width.saturating_sub(widths.len() + 1);
     let total_content_width = widths.iter().sum::<usize>();
@@ -222,6 +210,28 @@ fn fit_widths_to_terminal(
         widths[index] -= 1;
     }
     widths
+}
+
+fn minimum_column_widths(
+    widths: &[usize],
+    aligns: &[Align],
+    first_column_min: usize,
+) -> Vec<usize> {
+    widths
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            if aligns.get(index) == Some(&Align::Right) {
+                10
+            } else if index == 0 {
+                first_column_min
+            } else if index == 1 {
+                12
+            } else {
+                8
+            }
+        })
+        .collect()
 }
 
 fn cli_table_required_width(widths: &[usize]) -> usize {
@@ -404,6 +414,77 @@ mod tests {
         );
 
         assert!(cli_table_required_width(&widths) <= 60);
+    }
+
+    #[test]
+    fn preserves_iso_date_when_full_minimum_layout_fits_terminal() {
+        let mut table = SimpleTable::new(
+            vec![
+                "Date",
+                "Agent",
+                "Input",
+                "Output",
+                "Cache Create",
+                "Cache Read",
+                "Total Tokens",
+                "Cost (USD)",
+            ],
+            vec![
+                Align::Left,
+                Align::Left,
+                Align::Right,
+                Align::Right,
+                Align::Right,
+                Align::Right,
+                Align::Right,
+                Align::Right,
+            ],
+            TerminalStyle {
+                no_color: true,
+                ..TerminalStyle::default()
+            },
+        )
+        .with_terminal_width(120)
+        .with_date_compaction(true);
+        table.push(vec![
+            "2026-07-11".to_string(),
+            "All".to_string(),
+            "183,137,764".to_string(),
+            "21,672,224".to_string(),
+            "288,439".to_string(),
+            "8,658,714,233".to_string(),
+            "8,863,812,660".to_string(),
+            "$5612.24".to_string(),
+        ]);
+
+        let lines = table.render_lines();
+        assert!(
+            lines.iter().any(|line| line.contains("2026-07-11")),
+            "{}",
+            lines.join("\n")
+        );
+    }
+
+    #[test]
+    fn compacts_iso_date_when_full_minimum_layout_cannot_fit() {
+        let mut table = SimpleTable::new(
+            vec!["Date"],
+            vec![Align::Left],
+            TerminalStyle {
+                no_color: true,
+                ..TerminalStyle::default()
+            },
+        )
+        .with_terminal_width(13)
+        .with_date_compaction(true);
+        table.push(vec!["2026-07-11".to_string()]);
+
+        let lines = table.render_lines();
+        assert!(
+            lines.iter().any(|line| line.contains("07-11")),
+            "{}",
+            lines.join("\n")
+        );
     }
 
     #[test]
