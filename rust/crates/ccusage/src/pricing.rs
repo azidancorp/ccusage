@@ -1131,17 +1131,20 @@ impl PricingMap {
                 ..glm_base
             },
         );
-        let glm_51_pricing = Pricing {
+        // GLM-5.1 and GLM-5.2 currently share the official token rates, but
+        // their published context limits differ.
+        let glm_5x_pricing = Pricing {
             input: 1.4e-6,
             output: 4.4e-6,
             cache_read: 0.26e-6,
             ..glm_base
         };
-        self.entries.insert("glm-5.1".to_string(), glm_51_pricing);
-        self.entries.insert("glm-5.2".to_string(), glm_51_pricing);
-        for model in ["glm-5", "glm-5-turbo", "glm-5.1", "glm-5.2"] {
+        self.entries.insert("glm-5.1".to_string(), glm_5x_pricing);
+        self.entries.insert("glm-5.2".to_string(), glm_5x_pricing);
+        for model in ["glm-5", "glm-5-turbo", "glm-5.1"] {
             self.context_limits.insert(model.to_string(), 200_000);
         }
+        self.context_limits.insert("glm-5.2".to_string(), 1_000_000);
         self.context_limits.insert("gpt-5.5".to_string(), 1_050_000);
         self.context_limits
             .insert("grok-4.3".to_string(), 1_000_000);
@@ -1623,6 +1626,7 @@ mod tests {
         assert_eq!(glm_51.cache_create, 0.0);
         assert_eq!(glm_51.cache_read, 0.26e-6);
         assert!(glm_51.cache_read_explicit);
+        assert_eq!(pricing.context_limit("glm-5.1"), Some(200_000));
 
         let glm_52 = pricing.find("glm-5.2").unwrap();
         assert_eq!(glm_52.input, 1.4e-6);
@@ -1630,7 +1634,8 @@ mod tests {
         assert_eq!(glm_52.cache_create, 0.0);
         assert_eq!(glm_52.cache_read, 0.26e-6);
         assert!(glm_52.cache_read_explicit);
-        assert_eq!(pricing.context_limit("zai/glm-5.2"), Some(200_000));
+        assert_eq!(pricing.context_limit("glm-5.2"), Some(1_000_000));
+        assert_eq!(pricing.context_limit("zai/glm-5.2"), Some(1_000_000));
 
         let glm_5 = pricing.find("glm-5").unwrap();
         assert_eq!(glm_5.input, 1.0e-6);
