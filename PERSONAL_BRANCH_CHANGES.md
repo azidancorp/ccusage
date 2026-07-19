@@ -8,11 +8,11 @@ need separate entries.
 
 ## Audit Baseline
 
-- Last audited: 2026-07-15.
-- Compared `personal` through `06d84397`, including the GLM context-limit and
-  responsive-table fixes, against `main` at `ba99c0d09b6d`.
-- `personal` is currently missing `main` commits `dad1b5d8` and `ba99c0d0`.
-  Those benchmark-fixture build changes are branch lag, not personal policy.
+- Last audited: 2026-07-19.
+- Merged `main` through `07eb5f26` into `personal` through `c8880f8f`.
+- The five incorporated `main` commits cover benchmark tooling, Nix setup and
+  caching, and release triggers. None overlap, absorb, or retire an active
+  personal divergence.
 - The `backup/personal-*` refs are ancestors of `personal`; they contain no
   additional divergence that needs to be recovered.
 
