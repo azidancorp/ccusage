@@ -8,11 +8,14 @@ need separate entries.
 
 ## Audit Baseline
 
-- Last audited: 2026-07-19.
-- Merged `main` through `07eb5f26` into `personal` through `c8880f8f`.
-- The five incorporated `main` commits cover benchmark tooling, Nix setup and
-  caching, and release triggers. None overlap, absorb, or retire an active
-  personal divergence.
+- Last audited: 2026-07-24.
+- Merged `main` through `31e084af` into `personal` at `a494c093`.
+- The 13 incorporated `main` commits cover the v20.0.18 release, embedded
+  models.dev Moonshot/Kimi pricing, dependency and native-package maintenance,
+  and CI/release automation. The embedded pricing complements but does not
+  absorb the personal Kimi source-fidelity rules, runtime pricing cache, or
+  explicit GLM pricing/context overrides.
+- No active personal divergence was absorbed or retired by this merge.
 - The `backup/personal-*` refs are ancestors of `personal`; they contain no
   additional divergence that needs to be recovered.
 
